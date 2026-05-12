@@ -102,6 +102,7 @@ class HaierDeviceConfig(object):
                 "attrname": attr.get("name"),
                 "description": attr.get('description'),
                 "name": attr.get('id'),
+                "currentValue": attr.get('current'),
                 "list": {
                     "data": [{
                         "data": str(m.get('haier')),
