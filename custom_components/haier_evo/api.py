@@ -800,6 +800,7 @@ class HaierDevice(object):
         device_cls = {
             "AC": HaierAC,
             "REF": HaierREF,
+            "WM": HaierWM,
         }.get(device_type, cls)
         if device_cls is cls:
             _LOGGER.warning(f"Unknown device type: {device_type}")
@@ -1327,6 +1328,107 @@ class HaierREF(HaierDevice):
             entities.append(binary_sensor.HaierREFVacationSensor(self))
         if self.config['door_open'] is not None:
             entities.append(binary_sensor.HaierREFDoorSensor(self))
+        return entities
+
+
+class HaierWM(HaierDevice):
+
+    def __init__(
+        self,
+        backend_data: dict = None,
+        **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.status = None
+        self.program = None
+        self.temperature = None
+        self.spin_speed = None
+        self.remaining_time = None
+        self._get_status(backend_data)
+
+    @property
+    def config(self) -> CFG.HaierWMConfig:
+        return self._config
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data.update({
+            "status": self.status,
+            "program": self.program,
+            "temperature": self.temperature,
+            "spin_speed": self.spin_speed,
+            "remaining_time": self.remaining_time,
+        })
+        return data
+
+    def _load_config_from_attributes(self, data: dict) -> None:
+        self._config = CFG.HaierWMConfig(self.device_model, self.hass.config.path(C.DOMAIN))
+        attributes = data.setdefault("attributes", [])
+        attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
+        for attr in attrs:
+            self.config.attrs.append(attr)
+        self.config.merge_attributes()
+        for attr in self.config.attrs:
+            self._set_attribute_value(str(attr.code), attr.current)
+            _LOGGER.debug(f"{self.device_name}: {attr}")
+
+    def _set_attribute_value(self, code: str, value: str) -> None:
+        attr = self.config.get_attr_by_code(code)
+        if not (attr and value is not None):
+            return
+        elif attr.name == "status":
+            self.status = attr.get_item_name(value)
+        elif attr.name == "program":
+            self.program = attr.get_item_name(value)
+        elif attr.name == "temperature":
+            self.temperature = attr.get_item_name(value)
+        elif attr.name == "spin_speed":
+            self.spin_speed = attr.get_item_name(value)
+        elif attr.name == "remaining_time":
+            self.remaining_time = float(value) if value else None
+
+    def get_program_options(self) -> list[str]:
+        return self.config.get_values('program')
+
+    def get_temperature_options(self) -> list[str]:
+        return self.config.get_values('temperature')
+
+    def get_spin_speed_options(self) -> list[str]:
+        return self.config.get_values('spin_speed')
+
+    def set_program(self, value: str) -> None:
+        if commands := self.get_commands("program", value):
+            self._send_single_command(commands[0])
+            self.program = value
+
+    def set_temperature(self, value: str) -> None:
+        if commands := self.get_commands("temperature", value):
+            self._send_single_command(commands[0])
+            self.temperature = value
+
+    def set_spin_speed(self, value: str) -> None:
+        if commands := self.get_commands("spin_speed", value):
+            self._send_single_command(commands[0])
+            self.spin_speed = value
+
+    def create_entities_select(self) -> list:
+        from . import select
+        entities = []
+        if self.config['program'] is not None:
+            entities.append(select.HaierWMProgramSelect(self))
+        if self.config['temperature'] is not None:
+            entities.append(select.HaierWMTemperatureSelect(self))
+        if self.config['spin_speed'] is not None:
+            entities.append(select.HaierWMSpinSpeedSelect(self))
+        return entities
+
+    def create_entities_sensor(self) -> list:
+        from . import sensor
+        entities = []
+        if self.config['remaining_time'] is not None:
+            entities.append(sensor.HaierWMRemainingTimeSensor(self))
+        if self.config['status'] is not None:
+            entities.append(sensor.HaierWMStatusSensor(self))
         return entities
 
 
