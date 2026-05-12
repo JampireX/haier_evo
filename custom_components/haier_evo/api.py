@@ -638,7 +638,9 @@ class HaierDevice(object):
 
     @property
     def available(self) -> bool:
-        return self._available
+        # return self._available
+        # this works very bad
+        return True
 
     @available.setter
     def available(self, value: bool | str):
