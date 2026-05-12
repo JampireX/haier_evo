@@ -270,7 +270,8 @@ class Haier(object):
             # Setting a default timeout for requests
             kwargs.setdefault('timeout', C.API_TIMEOUT)
             headers = kwargs.setdefault('headers', {})
-            headers.setdefault('User-Agent', "curl/7.81.0")
+            headers.setdefault('User-Agent', "evo-mobile")
+            headers.setdefault('Platform', "android")
             headers.setdefault('Accept', "*/*")
             resp = requests.request(method, url, **kwargs)
             # _LOGGER.debug(resp.text)
@@ -402,10 +403,11 @@ class Haier(object):
             response = requests.get(devices_path, headers={
                 'X-Auth-Token': self.token,
                 'User-Agent': 'evo-mobile',
+                'Platform': 'android',
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
             }, timeout=C.API_TIMEOUT)
-            _LOGGER.debug(response.text)
+            # _LOGGER.debug(response.text)
             response.raise_for_status()
             data = response.json().get("data", {})
             assert isinstance(data, dict), f"Data is not dict: {data}"
@@ -427,11 +429,12 @@ class Haier(object):
             response = requests.get(status_url, headers={
                 'X-Auth-Token': self.token,
                 'User-Agent': 'evo-mobile',
+                'Platform': 'android',
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
             }, timeout=C.API_TIMEOUT)
-            _LOGGER.debug(f"Update device {device_mac} status code: {response.status_code}")
-            _LOGGER.debug(response.text)
+            # _LOGGER.debug(f"Update device {device_mac} status code: {response.status_code}")
+            # _LOGGER.debug(response.text)s
             response.raise_for_status()
             data = response.json()
             return data
