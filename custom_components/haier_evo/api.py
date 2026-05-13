@@ -722,13 +722,16 @@ class HaierDevice(object):
 
     def _send_group_command(self, commands: list[dict]) -> None:
         trace = str(uuid.uuid4())
-        self._send_message({
+        _ = self._send_message({
             "action": "operation",
             "macAddress": self.device_id,
             "commandName": self.config.command_name,
             "commands": commands,
             "trace": trace,
-        })
+        }) if self.config.command_name else [
+            self._send_single_command(c)
+            for c in commands
+        ]
 
     def _send_single_command(self, command: dict) -> None:
         trace = str(uuid.uuid4())
