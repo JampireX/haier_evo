@@ -78,7 +78,7 @@ A blank `id: ""` means "rely on whatever the API reports" (see `default.yaml`).
 
 ## Working in this repo
 
-- **No build, no test suite, no linter** is configured. Validation in CI is only the HACS GitHub action (`.github/workflows/validate.yaml`), which checks the integration's HACS/manifest metadata — not the Python.
+- **No build, no test suite, no linter** is configured. CI runs in `.github/workflows/`: `validate.yml` (HACS + hassfest metadata validation) and `release.yml` (auto-release, see below) — neither checks the Python.
 - **To run/iterate**: copy (or symlink) `custom_components/haier_evo` into a real Home Assistant `config/custom_components/`, restart HA, add the integration with Evo credentials, and watch HA logs (`custom_components.haier_evo` logger, set to debug). The GET debug endpoint above is the fastest way to inspect parsed state.
-- **Releasing**: bump `version` in `custom_components/haier_evo/manifest.json`. Minimum HA version is declared in `hacs.json` (`2024.12.0`). Runtime deps (`requests`, `websocket-client`, `ratelimit`) are in the manifest's `requirements`; the code also imports `tenacity` and `aiohttp` (provided by HA).
+- **Releasing (RULE): every time a push is requested, FIRST bump `version` in `custom_components/haier_evo/manifest.json`, then push to `main`.** The `release.yml` workflow reads the manifest version and auto-creates a matching GitHub Release (which HACS consumes). Do NOT create git tags manually — the release owns its tag. Minimum HA version is declared in `hacs.json` (`2024.12.0`). Runtime deps (`requests`, `websocket-client`, `ratelimit`) are in the manifest's `requirements`; the code also imports `tenacity` and `aiohttp` (provided by HA).
 - Commit messages in this repo are typically prefixed with the GitHub issue number (e.g. `#74 ...`).
