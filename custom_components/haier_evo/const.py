@@ -20,6 +20,10 @@ API_TIMEOUT = 15
 # idle is buffered into the dead socket and lost. WS_PING_TIMEOUT must be < WS_PING_INTERVAL.
 WS_PING_INTERVAL = 10
 WS_PING_TIMEOUT = 5
+# After a successful send() we wait this long and re-check the socket: a half-open
+# connection can close a few ms after send() returned (no exception raised), silently
+# losing the command. If the socket is down by then we raise to trigger the retry/resend.
+WS_POST_SEND_CHECK = 0.06
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
