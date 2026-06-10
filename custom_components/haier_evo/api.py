@@ -836,6 +836,9 @@ class HaierDevice(object):
     def _handle_status_update(self, received_message: dict) -> None:
         statuses = received_message.get("payload", {}).get("statuses") or [{}]
         properties = (statuses[0] or {}).get("properties") or {}
+        # Visible at INFO so it is clear whether realtime updates actually arrive and which
+        # attributes they carry (the raw "Received WSS message" log is only at DEBUG).
+        _LOGGER.info(f"WS status update for {self.device_name}: {properties}")
         with self._lock:
             for key, value in properties.items():
                 self._set_attribute_value(key, value)
@@ -1208,6 +1211,7 @@ class HaierAC(HaierDevice):
             }
         ])
         self.target_temperature = value
+        self.write_ha_state()
 
     def _get_status_commands(self, turn_on: bool) -> list[dict]:
         # Power on/off command, with a guaranteed numeric fallback. The value is normally
@@ -1239,82 +1243,98 @@ class HaierAC(HaierDevice):
         ])
         self.status = 1
         self.mode = value
+        self.write_ha_state()
 
     def switch_off(self) -> None:
         self._send_commands([
             *self._get_status_commands(turn_on=False),
         ])
         self.status = 0
+        self.write_ha_state()
 
     def set_fan_mode(self, value: str) -> None:
         if commands := self.get_commands("fan_mode", value):
             self._send_commands(commands)
             self.fan_mode = value
+            self.write_ha_state()
 
     def set_swing_horizontal_mode(self, value: str) -> None:
         if commands := self.get_commands("swing_horizontal_mode", value):
             self._send_commands(commands)
             self.swing_horizontal_mode = value
+            self.write_ha_state()
 
     def set_swing_mode(self, value: str) -> None:
         if commands := self.get_commands("swing_mode", value):
             self._send_commands(commands)
             self.swing_mode = value
+            self.write_ha_state()
 
     def set_preset_mode(self, value: str) -> None:
         if commands := self.get_commands("preset_mode", value):
             self._send_commands(commands)
             self.preset_mode = value
+            self.write_ha_state()
 
     def set_light_on(self, value: bool) -> None:
         if commands := self.get_commands("light", value):
             self._send_commands(commands)
             self.light_on = value
+            self.write_ha_state()
 
     def set_sound_on(self, value: bool) -> None:
         if commands := self.get_commands("sound", value):
             self._send_commands(commands)
             self.sound_on = value
+            self.write_ha_state()
 
     def set_quiet_on(self, value: bool) -> None:
         if commands := self.get_commands("quiet", value):
             self._send_commands(commands)
             self.quiet_on = value
+            self.write_ha_state()
 
     def set_health_on(self, value: bool) -> None:
         if commands := self.get_commands("health", value):
             self._send_commands(commands)
             self.health_on = value
+            self.write_ha_state()
 
     def set_turbo_on(self, value: bool) -> None:
         if commands := self.get_commands("turbo", value):
             self._send_commands(commands)
             self.turbo_on = value
+            self.write_ha_state()
 
     def set_comfort_on(self, value: bool) -> None:
         if commands := self.get_commands("comfort", value):
             self._send_commands(commands)
             self.comfort_on = value
+            self.write_ha_state()
 
     def set_cleaning_on(self, value: bool) -> None:
         if commands := self.get_commands("cleaning", value):
             self._send_commands(commands)
             self.cleaning_on = value
+            self.write_ha_state()
 
     def set_antifreeze_on(self, value: bool) -> None:
         if commands := self.get_commands("antifreeze", value):
             self._send_commands(commands)
             self.antifreeze_on = value
+            self.write_ha_state()
 
     def set_autohumidity_on(self, value: bool) -> None:
         if commands := self.get_commands("autohumidity", value):
             self._send_commands(commands)
             self.autohumidity_on = value
+            self.write_ha_state()
 
     def set_eco_sensor(self, value: str) -> None:
         if commands := self.get_commands("eco_sensor", value):
             self._send_commands(commands)
             self.eco_sensor = value
+            self.write_ha_state()
 
     def create_entities_climate(self) -> list:
         from . import climate
