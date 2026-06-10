@@ -24,11 +24,12 @@ class HaierACEntity(ClimateEntity):
     _attr_translation_key = "conditioner"
     _attr_should_poll = False
     _attr_icon = "mdi:air-conditioner"
+    _attr_has_entity_name = True
+    _attr_name = None
 
     def __init__(self, device: api.HaierAC) -> None:
         self._device = weakref.proxy(device)
         self._attr_unique_id = f"{device.device_id}_{device.device_model}"
-        self._attr_name = device.device_name
         self._attr_supported_features = device.get_supported_features()
         self._attr_hvac_modes = device.get_hvac_modes()
         self._attr_fan_modes = device.get_fan_modes()

@@ -18,6 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 class HaierBinarySensor(BinarySensorEntity):
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(self, device: api.HaierDevice) -> None:
         self._device = weakref.proxy(device)
@@ -38,6 +39,16 @@ class HaierBinarySensor(BinarySensorEntity):
         return getattr(self._device, self._device_attr_name, False)
 
 
+class HaierWMRemoteControlSensor(HaierBinarySensor):
+    _attr_icon = "mdi:remote"
+
+    def __init__(self, device: api.HaierWM) -> None:
+        super().__init__(device)
+        self._device_attr_name = "remote_control"
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_remote_control"
+        self._attr_translation_key = "wm_remote_control"
+
+
 class HaierREFBinarySensor(HaierBinarySensor):
     _attr_icon = "mdi:fridge-outline"
 
@@ -48,7 +59,7 @@ class HaierREFDoorSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "door_open"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_door_open"
-        self._attr_name = f"{device.device_name} Дверь"
+        self._attr_translation_key = "ref_door"
 
 
 class HaierREFVacationSensor(HaierREFBinarySensor):
@@ -57,7 +68,7 @@ class HaierREFVacationSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "vacation_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_vacation"
-        self._attr_name = f"{device.device_name} Режим Отпуск"
+        self._attr_translation_key = "ref_vacation"
 
 
 class HaierREFSuperFreezeSensor(HaierREFBinarySensor):
@@ -66,7 +77,7 @@ class HaierREFSuperFreezeSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "super_freeze"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_freeze"
-        self._attr_name = f"{device.device_name} Супер-заморозка"
+        self._attr_translation_key = "ref_super_freeze"
 
 
 class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
@@ -75,4 +86,4 @@ class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "super_cooling"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_cooling"
-        self._attr_name = f"{device.device_name} Супер-охлаждение"
+        self._attr_translation_key = "ref_super_cooling"
