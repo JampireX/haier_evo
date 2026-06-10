@@ -70,13 +70,124 @@
         },
         "select": {
             "conditioner_eco_sensor": {
+                "name": "Эко-датчик",
                 "state": {
                     "off": "Выключен",
                     "outlining": "Обводящий",
                     "related": "Сопутствующий",
                     "on": "Активен"
                 }
+            },
+            "ref_fridge_mode": {
+                "name": "Режим холодильной камеры"
+            },
+            "ref_freezer_mode": {
+                "name": "Режим морозильной камеры"
+            },
+            "ref_my_zone": {
+                "name": "My Zone"
+            },
+            "wm_program": {
+                "name": "Программа",
+                "state": {
+                    "not_selected": "Не выбрана"
+                }
+            },
+            "wm_temperature": {
+                "name": "Температура"
+            },
+            "wm_spin_speed": {
+                "name": "Скорость отжима"
             }
+        },
+        "sensor": {
+            "ref_room_temperature": {
+                "name": "Температура в помещении"
+            },
+            "ref_fridge_temperature": {
+                "name": "Температура холодильной камеры"
+            },
+            "ref_freezer_temperature": {
+                "name": "Температура морозильной камеры"
+            },
+            "ref_fridge_mode": {
+                "name": "Режим холодильной камеры"
+            },
+            "ref_freezer_mode": {
+                "name": "Режим морозильной камеры"
+            },
+            "wm_remaining_time": {
+                "name": "Оставшееся время"
+            },
+            "wm_status": {
+                "name": "Статус"
+            }
+        },
+        "binary_sensor": {
+            "wm_remote_control": {
+                "name": "Дистанционное управление"
+            },
+            "ref_door": {
+                "name": "Дверь"
+            },
+            "ref_vacation": {
+                "name": "Режим Отпуск"
+            },
+            "ref_super_freeze": {
+                "name": "Супер-заморозка"
+            },
+            "ref_super_cooling": {
+                "name": "Супер-охлаждение"
+            }
+        },
+        "switch": {
+            "ac_light": {
+                "name": "Подсветка"
+            },
+            "ac_sound": {
+                "name": "Звуковой сигнал"
+            },
+            "ac_quiet": {
+                "name": "Тихий"
+            },
+            "ac_turbo": {
+                "name": "Турбо"
+            },
+            "ac_health": {
+                "name": "Здоровье"
+            },
+            "ac_comfort": {
+                "name": "Комфорт"
+            },
+            "ac_cleaning": {
+                "name": "Очистка"
+            },
+            "ac_antifreeze": {
+                "name": "Антизамерзание"
+            },
+            "ac_autohumidity": {
+                "name": "Авто влажность"
+            },
+            "ref_super_cooling": {
+                "name": "Супер-охлаждение"
+            },
+            "ref_super_freeze": {
+                "name": "Супер-заморозка"
+            },
+            "ref_vacation": {
+                "name": "Режим Отпуск"
+            },
+            "http_get": {
+                "name": "GET"
+            },
+            "http_post": {
+                "name": "POST"
+            }
+        }
+    },
+    "exceptions": {
+        "remote_control_disabled": {
+            "message": "Дистанционное управление выключено. Включите его на панели стиральной машины, чтобы изменять параметры."
         }
     }
 }

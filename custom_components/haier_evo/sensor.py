@@ -19,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 
 class HaierSensor(SensorEntity):
+    _attr_has_entity_name = True
 
     def __init__(self, device: api.HaierDevice):
         self._device = weakref.proxy(device)
@@ -47,7 +48,7 @@ class HaierREFTemperatureSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "current_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_temperature"
-        self._attr_name = f"{device.device_name} Температура в помещении"
+        self._attr_translation_key = "ref_room_temperature"
 
 
 class HaierREFFridgeTemperatureSensor(HaierREFTemperatureSensor):
@@ -56,7 +57,7 @@ class HaierREFFridgeTemperatureSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "current_fridge_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_fridge_temperature"
-        self._attr_name = f"{device.device_name} Температура холодильной камеры"
+        self._attr_translation_key = "ref_fridge_temperature"
 
 
 class HaierREFFreezerTemperatureSensor(HaierREFTemperatureSensor):
@@ -65,7 +66,7 @@ class HaierREFFreezerTemperatureSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "current_freezer_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_temperature"
-        self._attr_name = f"{device.device_name} Температура морозильной камеры"
+        self._attr_translation_key = "ref_freezer_temperature"
 
 
 class HaierREFFridgeModeSensor(HaierREFTemperatureSensor):
@@ -74,7 +75,7 @@ class HaierREFFridgeModeSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "fridge_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_fridge_mode"
-        self._attr_name = f"{device.device_name} Режим холодильной камеры"
+        self._attr_translation_key = "ref_fridge_mode"
 
     @property
     def native_value(self) -> float:
@@ -87,7 +88,7 @@ class HaierREFFreezerModeSensor(HaierREFFridgeModeSensor):
         super().__init__(device)
         self._device_attr_name = "freezer_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_mode"
-        self._attr_name = f"{device.device_name} Режим морозильной камеры"
+        self._attr_translation_key = "ref_freezer_mode"
 
 
 class HaierWMRemainingTimeSensor(HaierSensor):
@@ -96,7 +97,7 @@ class HaierWMRemainingTimeSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "remaining_time"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_remaining_time"
-        self._attr_name = f"{device.device_name} Оставшееся время"
+        self._attr_translation_key = "wm_remaining_time"
         self._attr_native_unit_of_measurement = "мин"
 
 
@@ -106,7 +107,7 @@ class HaierWMStatusSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "status"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_status"
-        self._attr_name = f"{device.device_name} Статус"
+        self._attr_translation_key = "wm_status"
 
     @property
     def native_value(self) -> str:

@@ -1,0 +1,55 @@
+command_name: "8"
+attributes:
+  - name: status
+    id: "25"
+    mappings:
+      - haier: "false"
+        value: "off"
+      - haier: "true"
+        value: "on"
+  - name: spin_speed
+    id: "61"
+    mappings:
+      - haier: "0"
+        value: "off"
+      - haier: "200"
+        value: "200"
+      - haier: "400"
+        value: "400"
+      - haier: "600"
+        value: "600"
+      - haier: "800"
+        value: "800"
+      - haier: "1000"
+        value: "1000"
+  - name: temperature
+    id: "48"
+    mappings:
+      - haier: "0"
+        value: "cold"
+      - haier: "20"
+        value: "20"
+      - haier: "30"
+        value: "30"
+      - haier: "40"
+        value: "40"
+      - haier: "60"
+        value: "60"
+      - haier: "90"
+        value: "90"
+  # The device reports the remaining time as two read-only fields:
+  # hours (code 31, range 0-24) and minutes (code 32, range 0-59).
+  # The resulting value in minutes is computed in HaierWM.remaining_time.
+  - name: remaining_hours
+    id: "31"
+  - name: remaining_minutes
+    id: "32"
+  # Remote control (remoteControlMode.link.name == "24").
+  # When disabled, the machine only allows viewing parameters, not changing them.
+  - name: remote_control
+    id: "24"
+    mappings:
+      - haier: "0"
+        value: "off"
+      - haier: "1"
+        value: "on"

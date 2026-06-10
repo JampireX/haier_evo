@@ -70,13 +70,124 @@
         },
         "select": {
             "conditioner_eco_sensor": {
+                "name": "Eco sensor",
                 "state": {
                     "off": "Disabled",
                     "outlining": "Outlining",
                     "related": "Related",
                     "on": "Active"
                 }
+            },
+            "ref_fridge_mode": {
+                "name": "Fridge compartment mode"
+            },
+            "ref_freezer_mode": {
+                "name": "Freezer compartment mode"
+            },
+            "ref_my_zone": {
+                "name": "My Zone"
+            },
+            "wm_program": {
+                "name": "Program",
+                "state": {
+                    "not_selected": "Not selected"
+                }
+            },
+            "wm_temperature": {
+                "name": "Temperature"
+            },
+            "wm_spin_speed": {
+                "name": "Spin speed"
             }
+        },
+        "sensor": {
+            "ref_room_temperature": {
+                "name": "Indoor temperature"
+            },
+            "ref_fridge_temperature": {
+                "name": "Fridge compartment temperature"
+            },
+            "ref_freezer_temperature": {
+                "name": "Freezer compartment temperature"
+            },
+            "ref_fridge_mode": {
+                "name": "Fridge compartment mode"
+            },
+            "ref_freezer_mode": {
+                "name": "Freezer compartment mode"
+            },
+            "wm_remaining_time": {
+                "name": "Remaining time"
+            },
+            "wm_status": {
+                "name": "Status"
+            }
+        },
+        "binary_sensor": {
+            "wm_remote_control": {
+                "name": "Remote control"
+            },
+            "ref_door": {
+                "name": "Door"
+            },
+            "ref_vacation": {
+                "name": "Vacation mode"
+            },
+            "ref_super_freeze": {
+                "name": "Super freeze"
+            },
+            "ref_super_cooling": {
+                "name": "Super cooling"
+            }
+        },
+        "switch": {
+            "ac_light": {
+                "name": "Light"
+            },
+            "ac_sound": {
+                "name": "Sound"
+            },
+            "ac_quiet": {
+                "name": "Quiet"
+            },
+            "ac_turbo": {
+                "name": "Turbo"
+            },
+            "ac_health": {
+                "name": "Health"
+            },
+            "ac_comfort": {
+                "name": "Comfort"
+            },
+            "ac_cleaning": {
+                "name": "Cleaning"
+            },
+            "ac_antifreeze": {
+                "name": "Anti-freeze"
+            },
+            "ac_autohumidity": {
+                "name": "Auto humidity"
+            },
+            "ref_super_cooling": {
+                "name": "Super cooling"
+            },
+            "ref_super_freeze": {
+                "name": "Super freeze"
+            },
+            "ref_vacation": {
+                "name": "Vacation mode"
+            },
+            "http_get": {
+                "name": "GET"
+            },
+            "http_post": {
+                "name": "POST"
+            }
+        }
+    },
+    "exceptions": {
+        "remote_control_disabled": {
+            "message": "Remote control is disabled. Enable it on the washing machine panel to change parameters."
         }
     }
 }

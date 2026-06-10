@@ -218,9 +218,27 @@ class HaierWMConfig(HaierDeviceConfig):
             f"program={self['program']!r},"
             f"temperature={self['temperature']!r},"
             f"spin_speed={self['spin_speed']!r},"
-            f"remaining_time={self['remaining_time']!r}"
+            f"remaining_hours={self['remaining_hours']!r},"
+            f"remaining_minutes={self['remaining_minutes']!r}"
             f")"
         )
+
+    def merge_attributes(self) -> None:
+        # Washing machine attributes from the API have no names (description == "not found"),
+        # so the YAML description is matched to API attributes by CODE, not by name.
+        config_attrs = {str(a.code): a for a in self.get_config_attributes()}
+        for i, attr in enumerate(self.attrs[:]):
+            config_attr = config_attrs.pop(str(attr.code), None)
+            if config_attr is not None:
+                config_attr.current = attr.current
+                config_attr.range = attr.range
+                config_attr.list = config_attr.list or attr.list
+                self.attrs[i] = config_attr
+            if attr.command_name and not self.command_name:
+                self.command_name = attr.command_name
+        # YAML attributes with no matching API code are added as-is
+        self.attrs.extend(config_attrs.values())
+        self.attrs.sort(key=lambda a: a.code)
 
 
 class Attribute(dict):
@@ -228,7 +246,7 @@ class Attribute(dict):
     def __init__(self, data: dict) -> None:
         super().__init__(data)
         self.name = {
-            # Кондиционеры:
+            # Air conditioners:
             "Режимы": "mode",
             "Целевая температура": "target_temperature",
             "Температура в комнате": "current_temperature",
@@ -246,7 +264,7 @@ class Attribute(dict):
             "Эко-датчик": "eco_sensor",
             "Стерильная очистка": "cleaning",
             "Авто влажность": "autohumidity",
-            # Холодильники:
+            # Refrigerators:
             "Температура холодильника (℃)": "current_fridge_temperature",
             "Температура морозильной камеры (°C)": "current_freezer_temperature",
             "Температура в помещении": "current_temperature",
@@ -257,7 +275,7 @@ class Attribute(dict):
             "Режим Отпуск": "vacation_mode",
             "Состояние дверцы холодильника": "door_open",
             "My Zone": "my_zone",
-            # Стиральные машины:
+            # Washing machines:
             "Статус": "status",
             "Программа": "program",
             "Температура": "temperature",
@@ -337,17 +355,15 @@ class Attribute(dict):
     def range(self, value: dict) -> None:
         self["range"] = value
 
-    def get_item_code(self, name: str, default=None) -> str:
-        return str(getattr(next(filter(
-            lambda i: str(i.name) == name,
-            self.list
-        ), None), "value", default))
+    def get_item_code(self, name: str, default=None) -> str | None:
+        # Return the raw default (not the string "None") when no item matches,
+        # so callers can distinguish "no mapping" from a real value.
+        item = next(filter(lambda i: str(i.name) == name, self.list), None)
+        return str(item.value) if item is not None else default
 
-    def get_item_name(self, code: str, default=None) -> str:
-        return str(getattr(next(filter(
-            lambda i: str(i.value) == code,
-            self.list
-        ), None), "name", default))
+    def get_item_name(self, code: str, default=None) -> str | None:
+        item = next(filter(lambda i: str(i.value) == code, self.list), None)
+        return str(item.name) if item is not None else default
 
 
 class Range(dict):

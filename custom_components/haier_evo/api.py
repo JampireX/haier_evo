@@ -10,7 +10,7 @@ from aiohttp import web
 from enum import Enum
 from datetime import datetime, timezone, timedelta
 from tenacity import retry, stop_after_attempt, retry_if_exception_type, wait_fixed
-from websocket import WebSocketApp, WebSocket
+from websocket import WebSocketApp, WebSocket, WebSocketConnectionClosedException
 from requests.exceptions import ConnectionError, Timeout, HTTPError
 from urllib.parse import urlparse, urljoin, parse_qs
 from urllib3.exceptions import NewConnectionError
@@ -66,6 +66,11 @@ class HaierAPI(HomeAssistantView):
     async def get(self, request):
         if not getattr(self.haier, "allow_http", False):
             return web.Response(text="404: Not found", status=404, content_type="text/plain")
+        # re-fetch fresh data from the devices (in an executor so the loop is not blocked)
+        try:
+            await self.haier.hass.async_add_executor_job(self.haier.refresh_devices)
+        except Exception as e:
+            _LOGGER.warning(f"Failed to refresh devices on GET: {e}")
         return self.json(self.haier.to_dict())
 
     async def post(self, request):
@@ -139,6 +144,21 @@ class AuthResponse(object):
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
 
 
+def _log_send_message_failure(retry_state):
+    # Called by tenacity once send_message has exhausted every attempt: at this point the
+    # command is lost. We always log it as an error (and dump the payload + last exception)
+    # so a dropped command — in particular the first one after an idle period — is never
+    # silently swallowed.
+    payload = retry_state.args[1] if len(retry_state.args) > 1 else "<unknown>"
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    _LOGGER.error(
+        f"Command NOT sent (lost) after {retry_state.attempt_number} attempt(s). "
+        f"Last error: {exc!r}. Payload: {payload}"
+    )
+    return None
+
+
 class Haier(object):
 
     http = HaierAPI()
@@ -168,6 +188,7 @@ class Haier(object):
     ) -> None:
         self._lock = threading.Lock()
         self._pull_data = None
+        self._last_refresh = None
         self._device_id = str(uuid.uuid4())
         self.hass: HomeAssistant = hass
         self.devices: list[HaierDevice] = []
@@ -490,6 +511,28 @@ class Haier(object):
         if len(self.devices) > 0:
             self.connect_in_thread()
 
+    def refresh_devices(self, force: bool = False) -> None:
+        # Re-fetch the current state of all devices with TTL protection, so that frequent
+        # calls to the GET endpoint do not trigger a flood of REST requests.
+        if not self.devices:
+            return
+        now = time.monotonic()
+        # Only the TTL check/update is guarded; the network refresh runs outside the lock
+        # (pull_device_data -> auth() also takes this lock, so holding it here would deadlock).
+        with self._lock:
+            if (
+                not force
+                and self._last_refresh is not None
+                and (now - self._last_refresh) < C.API_REFRESH_TTL
+            ):
+                return
+            self._last_refresh = now
+        for device in self.devices:
+            try:
+                device.refresh()
+            except Exception as e:
+                _LOGGER.warning(f"Failed to refresh device {device.device_id}: {e}")
+
     def get_device_by_id(self, id_: str) -> HaierDevice | None:
         return next(filter(
             lambda d: d.device_id == id_,
@@ -530,26 +573,61 @@ class Haier(object):
 
     # noinspection PyUnusedLocal
     def _on_ping(self, ws: WebSocket) -> None:
-        self.socket_app.sock.pong()
+        # During reconnects socket_app.sock can be None — guard against AttributeError.
+        sock = getattr(self.socket_app, "sock", None)
+        if sock is None:
+            return
+        try:
+            sock.pong()
+        except Exception as e:
+            _LOGGER.debug(f"Failed to send pong: {e}")
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_close(self, ws: WebSocket, close_code: int, close_message: str) -> None:
+        # Reflect that the socket is down so connect_if_needed/_wait_websocket do not
+        # treat a connection that is being re-established as still INITIALIZED.
+        self.socket_status = SocketStatus.NOT_INITIALIZED
         _LOGGER.debug(f"Websocket closed. Code: {close_code}, message: {close_message}")
 
     def _wait_websocket(self, timeout: float) -> None:
         current = time.time()
         while time.time() <= (current + timeout):
             if self.socket_status == SocketStatus.INITIALIZED:
+                _LOGGER.info(
+                    f"_wait_websocket: socket became INITIALIZED after "
+                    f"{time.time() - current:.2f}s"
+                )
                 return
             time.sleep(0.1)
+        _LOGGER.warning(
+            f"_wait_websocket: timed out after {timeout}s waiting for the websocket to "
+            f"become INITIALIZED (socket_status="
+            f"{getattr(self.socket_status, 'name', self.socket_status)}); "
+            f"a command sent now is likely to be lost"
+        )
 
     def write_ha_state(self) -> None:
         for device in self.devices:
             device.write_ha_state()
 
+    def is_socket_connected(self) -> bool:
+        sock = getattr(self.socket_app, "sock", None)
+        return bool(sock is not None and getattr(sock, "connected", False))
+
     def connect_if_needed(self, timeout: float = 4.0) -> None:
         if self.socket_thread and self.socket_thread.is_alive():
+            _LOGGER.info(
+                "connect_if_needed: socket thread is alive, waiting for it to come up "
+                f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)})"
+            )
             return self._wait_websocket(timeout)
+        # No live thread: start one. Note that connect_in_thread does NOT block, so the
+        # caller may re-check the connection before it is actually up — a frequent reason
+        # the very first command after startup/idle is lost.
+        _LOGGER.info(
+            "connect_if_needed: no live socket thread, starting a new connection thread "
+            "(connection will come up asynchronously)"
+        )
         return self.connect_in_thread()
 
     def connect(self) -> None:
@@ -570,22 +648,54 @@ class Haier(object):
         try:
             self.socket_status = SocketStatus.INITIALIZING
             self._init_ws()
-            self.socket_app.run_forever(ping_interval=10)
+            # ping_timeout is required to detect a half-open (silently dead) connection:
+            # without it run_forever blocks forever on a dead socket and never reconnects.
+            self.socket_app.run_forever(
+                ping_interval=C.WS_PING_INTERVAL,
+                ping_timeout=C.WS_PING_TIMEOUT,
+            )
         except Exception as e:
             _LOGGER.error(f"Error connecting to websocket: {e}")
 
     @retry(
         retry=retry_if_exception_type(Exception),
         stop=stop_after_attempt(2),
-        retry_error_callback=lambda _: None,
+        retry_error_callback=_log_send_message_failure,
         wait=wait_fixed(0.5),
     )
     def send_message(self, payload: str) -> None:
-        _LOGGER.debug(f"Sending message: {payload}")
+        # A long-idle socket may be down (or reconnecting in the background): sending into
+        # it would either raise or — on a half-open connection — silently buffer the bytes
+        # and lose the command. Make sure the connection is live before sending, reconnecting
+        # and waiting for it to come up if needed.
+        connected = self.is_socket_connected()
+        thread_alive = bool(self.socket_thread and self.socket_thread.is_alive())
+        _LOGGER.info(
+            f"send_message: preparing to send "
+            f"(connected={connected}, "
+            f"socket_status={getattr(self.socket_status, 'name', self.socket_status)}, "
+            f"thread_alive={thread_alive})"
+        )
+        if not connected:
+            _LOGGER.info("Websocket is not connected, reconnecting before sending")
+            self.connect_if_needed()
+            connected = self.is_socket_connected()
+            _LOGGER.info(
+                f"send_message: after connect_if_needed "
+                f"(connected={connected}, "
+                f"socket_status={getattr(self.socket_status, 'name', self.socket_status)})"
+            )
+        _LOGGER.info(f"Sending message: {payload}")
         try:
+            if not self.is_socket_connected():
+                raise WebSocketConnectionClosedException(
+                    f"Websocket is not connected "
+                    f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)}, "
+                    f"thread_alive={bool(self.socket_thread and self.socket_thread.is_alive())})"
+                )
             self.socket_app.send(payload)
         except Exception as e:
-            _LOGGER.warning(f"Failed to send message: {e}")
+            _LOGGER.warning(f"Failed to send message (will retry): {e!r}. Payload: {payload}")
             self.connect_if_needed()
             raise e
 
@@ -610,6 +720,8 @@ class HaierDevice(object):
         self._available = True
         self._config = None
         self._status_data = backend_data
+        # Guards config rebuild (refresh) against concurrent reads from the WS thread.
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return (
@@ -679,29 +791,45 @@ class HaierDevice(object):
 
     def _get_status(self, data: dict) -> dict:
         self._status_data = data = (data or {})
-        info = data.setdefault("info", {})
+        # WM returns info/status/settings/attributes nested inside smartDeviceControl,
+        # while control/allProgram sit next to it at the top level of backend_data.
+        # AC/REF return everything at the top level. status_data is always kept complete.
+        inner = data.get("smartDeviceControl")
+        inner = inner if isinstance(inner, dict) else data
+        info = inner.setdefault("info", {})
         self.device_serial = info.setdefault("serialNumber", self.device_serial)
         device_model = info.setdefault("model", "AC")
         device_model = device_model.replace('-','').replace('/', '')[:11]
         self.device_model = device_model
-        self.available = data.setdefault("status", "ONLINE")
-        settings = data.setdefault("settings", {})
+        self.available = inner.setdefault("status", "ONLINE")
+        settings = inner.setdefault("settings", {})
         self.device_name = settings.setdefault("name", {}).setdefault("name", self.device_name)
         self.sw_version = settings.setdefault('firmware', {}).setdefault('value', None)
-        # read config and current values
-        self._load_config_from_attributes(data)
+        # read config and current values (inner view: info/attributes/businessAttributes)
+        self._load_config_from_attributes(inner)
         return data
 
     def _load_config_from_attributes(self, data: dict) -> None:
         pass
 
+    def refresh(self) -> None:
+        # Re-fetch the device's fresh state over REST and re-parse it.
+        # The network call stays outside the lock; only the config rebuild is guarded
+        # so a concurrent WS status update cannot read a half-rebuilt config.
+        data = self._haier.pull_device_data(self.device_id)
+        with self._lock:
+            self._get_status(data)
+        self.write_ha_state()
+
     def _set_attribute_value(self, code: str, value: str) -> None:
         pass
 
     def _handle_status_update(self, received_message: dict) -> None:
-        message_statuses = received_message.get("payload", {}).get("statuses", [{}])
-        for key, value in message_statuses[0]['properties'].items():
-            self._set_attribute_value(key, value)
+        statuses = received_message.get("payload", {}).get("statuses") or [{}]
+        properties = (statuses[0] or {}).get("properties") or {}
+        with self._lock:
+            for key, value in properties.items():
+                self._set_attribute_value(key, value)
         self.available = True
         self.write_ha_state()
 
@@ -750,10 +878,17 @@ class HaierDevice(object):
         if custom := self.config.get_command_by_name(f"{name}_{value}"):
             return custom
         attr = self.config.get_attr_by_name(name)
+        if attr is None:
+            return []
+        item_code = attr.get_item_code(value)
+        if item_code is None:
+            # Unmapped value — do not send a "None" command to the device.
+            _LOGGER.warning(f"No mapping for {name}={value!r} on {self.device_name}, command skipped")
+            return []
         return self.constraint.apply([{
             "commandName": str(attr.code),
-            "value": attr.get_item_code(value),
-        }] if attr else [])
+            "value": item_code,
+        }])
 
     def on_message(self, message_dict: dict) -> None:
         message_type = message_dict.get("event", "")
@@ -805,19 +940,25 @@ class HaierDevice(object):
         device_serial: str = None,
         device_title: str = None,
     ) -> HaierDevice:
+        backend_data = haier.pull_device_data(device_mac)
         device_cls = {
             "AC": HaierAC,
             "REF": HaierREF,
             "WM": HaierWM,
         }.get(device_type, cls)
         if device_cls is cls:
-            _LOGGER.warning(f"Unknown device type: {device_type}")
+            # type not recognized from the deep-link — try to infer it from the response structure
+            if isinstance(backend_data, dict) and "smartDeviceControl" in backend_data:
+                device_cls = HaierWM
+                _LOGGER.warning(f"Unknown device type {device_type!r}, detected as WM by payload")
+            else:
+                _LOGGER.warning(f"Unknown device type: {device_type}")
         return device_cls(
             haier=haier,
             device_mac=device_mac,
             device_serial=device_serial,
             device_title=device_title,
-            backend_data=haier.pull_device_data(device_mac),
+            backend_data=backend_data,
         )
 
 
@@ -1351,12 +1492,25 @@ class HaierWM(HaierDevice):
         self.program = None
         self.temperature = None
         self.spin_speed = None
-        self.remaining_time = None
+        self.remaining_hours = None
+        self.remaining_minutes = None
+        self.remote_control = None
+        self.programs: list[dict] = []
         self._get_status(backend_data)
 
     @property
     def config(self) -> CFG.HaierWMConfig:
         return self._config
+
+    @property
+    def remaining_time(self) -> float | None:
+        # A switched-off machine keeps reporting the last remaining time (e.g. 33 min) —
+        # that is a stale value, so when status == "off" we show 0.
+        if self.status == "off":
+            return 0
+        if self.remaining_hours is None and self.remaining_minutes is None:
+            return None
+        return (self.remaining_hours or 0) * 60 + (self.remaining_minutes or 0)
 
     def to_dict(self) -> dict:
         data = super().to_dict()
@@ -1365,7 +1519,11 @@ class HaierWM(HaierDevice):
             "program": self.program,
             "temperature": self.temperature,
             "spin_speed": self.spin_speed,
+            "remaining_hours": self.remaining_hours,
+            "remaining_minutes": self.remaining_minutes,
             "remaining_time": self.remaining_time,
+            "remote_control": self.remote_control,
+            "programs": [p["name"] for p in self.programs],
         })
         return data
 
@@ -1379,6 +1537,8 @@ class HaierWM(HaierDevice):
         for attr in self.config.attrs:
             self._set_attribute_value(str(attr.code), attr.current)
             _LOGGER.debug(f"{self.device_name}: {attr}")
+        # programs are parsed from the full backend_data: allProgram/control sit next to smartDeviceControl
+        self._parse_programs(self.status_data)
 
     def _set_attribute_value(self, code: str, value: str) -> None:
         attr = self.config.get_attr_by_code(code)
@@ -1392,10 +1552,67 @@ class HaierWM(HaierDevice):
             self.temperature = attr.get_item_name(value)
         elif attr.name == "spin_speed":
             self.spin_speed = attr.get_item_name(value)
-        elif attr.name == "remaining_time":
-            self.remaining_time = float(value) if value else None
+        elif attr.name == "remaining_hours":
+            self.remaining_hours = parseint(value)
+        elif attr.name == "remaining_minutes":
+            self.remaining_minutes = parseint(value)
+        elif attr.name == "remote_control":
+            self.remote_control = parsebool(attr.get_item_name(value, value))
+
+    def _parse_programs(self, data: dict) -> None:
+        data = data or {}
+        # businessAttributes sit inside smartDeviceControl, while allProgram/control sit next to it.
+        sdc = data.get("smartDeviceControl") if isinstance(data.get("smartDeviceControl"), dict) else data
+        business = sdc.get("businessAttributes") or data.get("businessAttributes") or []
+        all_program = data.get("allProgram") or sdc.get("allProgram") or {}
+        control = data.get("control") or sdc.get("control") or {}
+        # Program definitions: businessAttributes[].name (link) -> set of commands
+        definitions = {}
+        for ba in business:
+            link = ba.get("name")
+            params = ba.get("commandParameters") or {}
+            commands = [
+                {"commandName": str(a.get("name")), "value": str(a.get("defaultValue"))}
+                for a in (params.get("attrNameList") or [])
+                if a.get("name") is not None and a.get("defaultValue") is not None
+            ]
+            if link and commands:
+                definitions[link] = commands
+        # UI catalog: allProgram.blocks[].programs[] -> Russian names and links
+        programs, seen = [], set()
+        for block in all_program.get("blocks", []) or []:
+            for prog in block.get("programs", []) or []:
+                link = ((prog.get("programConfig") or {}).get("link") or {}).get("name")
+                name = (prog.get("preview") or {}).get("name")
+                commands = definitions.get(link)
+                if not (name and commands) or name in seen:
+                    continue
+                seen.add(name)
+                programs.append({
+                    "name": name,
+                    "link": link,
+                    "template_id": prog.get("templateId"),
+                    "commands": commands,
+                })
+        self.programs = programs
+        # Current program, if the device reports it
+        current = (control.get("currentProgram") or {}).get("title")
+        if current:
+            self.program = current
+
+    def _ensure_remote_control(self) -> None:
+        # When remote control is disabled the machine (like the native app) only allows
+        # viewing the parameters, not changing them.
+        # remote_control is None means the model does not report this attribute — do not block then.
+        if self.remote_control is False:
+            raise HomeAssistantError(
+                translation_domain=C.DOMAIN,
+                translation_key="remote_control_disabled",
+            )
 
     def get_program_options(self) -> list[str]:
+        if self.programs:
+            return [p["name"] for p in self.programs]
         return self.config.get_values('program')
 
     def get_temperature_options(self) -> list[str]:
@@ -1405,16 +1622,26 @@ class HaierWM(HaierDevice):
         return self.config.get_values('spin_speed')
 
     def set_program(self, value: str) -> None:
+        self._ensure_remote_control()
+        program = next((p for p in self.programs if p["name"] == value), None)
+        if program is not None:
+            if program["commands"]:
+                self._send_commands(program["commands"])
+                self.program = value
+            return
+        # fallback: a single attribute from YAML
         if commands := self.get_commands("program", value):
             self._send_single_command(commands[0])
             self.program = value
 
     def set_temperature(self, value: str) -> None:
+        self._ensure_remote_control()
         if commands := self.get_commands("temperature", value):
             self._send_single_command(commands[0])
             self.temperature = value
 
     def set_spin_speed(self, value: str) -> None:
+        self._ensure_remote_control()
         if commands := self.get_commands("spin_speed", value):
             self._send_single_command(commands[0])
             self.spin_speed = value
@@ -1422,7 +1649,7 @@ class HaierWM(HaierDevice):
     def create_entities_select(self) -> list:
         from . import select
         entities = []
-        if self.config['program'] is not None:
+        if self.programs or self.config['program'] is not None:
             entities.append(select.HaierWMProgramSelect(self))
         if self.config['temperature'] is not None:
             entities.append(select.HaierWMTemperatureSelect(self))
@@ -1433,10 +1660,17 @@ class HaierWM(HaierDevice):
     def create_entities_sensor(self) -> list:
         from . import sensor
         entities = []
-        if self.config['remaining_time'] is not None:
+        if self.config['remaining_minutes'] is not None or self.config['remaining_hours'] is not None:
             entities.append(sensor.HaierWMRemainingTimeSensor(self))
         if self.config['status'] is not None:
             entities.append(sensor.HaierWMStatusSensor(self))
+        return entities
+
+    def create_entities_binary_sensor(self) -> list:
+        from . import binary_sensor
+        entities = []
+        if self.config['remote_control'] is not None:
+            entities.append(binary_sensor.HaierWMRemoteControlSensor(self))
         return entities
 
 
@@ -1444,3 +1678,10 @@ def parsebool(value) -> bool:
     if value in ("on", 1, True, "true", "enable", "1"):
         return True
     return False
+
+
+def parseint(value) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
