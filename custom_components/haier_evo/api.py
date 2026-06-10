@@ -10,7 +10,7 @@ from aiohttp import web
 from enum import Enum
 from datetime import datetime, timezone, timedelta
 from tenacity import retry, stop_after_attempt, retry_if_exception_type, wait_fixed
-from websocket import WebSocketApp, WebSocket, WebSocketConnectionClosedException
+from websocket import WebSocketApp, WebSocket
 from requests.exceptions import ConnectionError, Timeout, HTTPError
 from urllib.parse import urlparse, urljoin, parse_qs
 from urllib3.exceptions import NewConnectionError
@@ -187,6 +187,9 @@ class Haier(object):
         http: bool = C.API_HTTP_ROUTE
     ) -> None:
         self._lock = threading.Lock()
+        # Serializes WebSocket writes: HA executor threads and the WS thread (_on_open ->
+        # init_if_needed) can otherwise call socket_app.send() concurrently and corrupt frames.
+        self._send_lock = threading.Lock()
         self._pull_data = None
         self._last_refresh = None
         self._device_id = str(uuid.uuid4())
@@ -614,6 +617,11 @@ class Haier(object):
         sock = getattr(self.socket_app, "sock", None)
         return bool(sock is not None and getattr(sock, "connected", False))
 
+    def _is_socket_ready(self) -> bool:
+        # Ready to send only when both signals agree: the status flag is INITIALIZED
+        # (set by _on_open / cleared by _on_close) and the underlying sock is connected.
+        return self.socket_status == SocketStatus.INITIALIZED and self.is_socket_connected()
+
     def connect_if_needed(self, timeout: float = 4.0) -> None:
         if self.socket_thread and self.socket_thread.is_alive():
             _LOGGER.info(
@@ -661,43 +669,44 @@ class Haier(object):
         retry=retry_if_exception_type(Exception),
         stop=stop_after_attempt(2),
         retry_error_callback=_log_send_message_failure,
-        wait=wait_fixed(0.5),
+        wait=wait_fixed(1.0),
     )
     def send_message(self, payload: str) -> None:
-        # A long-idle socket may be down (or reconnecting in the background): sending into
-        # it would either raise or — on a half-open connection — silently buffer the bytes
-        # and lose the command. Make sure the connection is live before sending, reconnecting
-        # and waiting for it to come up if needed.
-        connected = self.is_socket_connected()
-        thread_alive = bool(self.socket_thread and self.socket_thread.is_alive())
-        _LOGGER.info(
-            f"send_message: preparing to send "
-            f"(connected={connected}, "
-            f"socket_status={getattr(self.socket_status, 'name', self.socket_status)}, "
-            f"thread_alive={thread_alive})"
-        )
-        if not connected:
-            _LOGGER.info("Websocket is not connected, reconnecting before sending")
-            self.connect_if_needed()
-            connected = self.is_socket_connected()
-            _LOGGER.info(
-                f"send_message: after connect_if_needed "
-                f"(connected={connected}, "
-                f"socket_status={getattr(self.socket_status, 'name', self.socket_status)})"
-            )
-        _LOGGER.info(f"Sending message: {payload}")
-        try:
-            if not self.is_socket_connected():
-                raise WebSocketConnectionClosedException(
-                    f"Websocket is not connected "
+        # A long-idle socket may be down or half-open: a send() into it can either raise or —
+        # worse — return successfully and then the socket closes a few ms later, silently
+        # losing the command (no exception, so the retry never fires). To avoid that we:
+        #   1) serialize all sends (concurrent writes corrupt frames),
+        #   2) fail fast on a dead socket before sending (reconnect, else raise -> retry),
+        #   3) re-check right after sending and, if the socket just closed, raise -> retry
+        #      (which reconnects and resends; all our commands carry absolute values, so a
+        #       duplicate resend is harmless).
+        with self._send_lock:
+            if not self._is_socket_ready():
+                _LOGGER.warning(
+                    f"Socket not ready before send "
                     f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)}, "
-                    f"thread_alive={bool(self.socket_thread and self.socket_thread.is_alive())})"
+                    f"connected={self.is_socket_connected()}), reconnecting before sending"
                 )
-            self.socket_app.send(payload)
-        except Exception as e:
-            _LOGGER.warning(f"Failed to send message (will retry): {e!r}. Payload: {payload}")
-            self.connect_if_needed()
-            raise e
+                self.connect_if_needed()
+                if not self._is_socket_ready():
+                    raise ConnectionError("Socket not ready after reconnect attempt")
+            _LOGGER.info(f"Sending message: {payload}")
+            try:
+                self.socket_app.send(payload)
+            except Exception as e:
+                _LOGGER.warning(f"Failed to send message (will retry): {e!r}. Payload: {payload}")
+                self.connect_if_needed()
+                raise e
+            # Post-send check: catch a silent loss when the socket closes right after send()
+            # returned (observed ~25ms after send in debug logs). A short window is enough.
+            time.sleep(C.WS_POST_SEND_CHECK)
+            if not self._is_socket_ready():
+                _LOGGER.warning(
+                    f"Socket closed right after send — message likely lost, retrying. "
+                    f"Payload: {payload}"
+                )
+                self.connect_if_needed()
+                raise ConnectionError("Socket closed right after send")
 
 
 class HaierDevice(object):
@@ -895,7 +904,13 @@ class HaierDevice(object):
         if message_type == "status":
             self._handle_status_update(message_dict)
         elif message_type == "command_response":
-            pass
+            # The device acknowledges every command here; errNo != 0 means it rejected it.
+            # Surface rejections at WARNING so a dropped/refused command is easy to diagnose.
+            err_no = message_dict.get("errNo", 0)
+            if err_no not in (0, "0", None):
+                _LOGGER.warning(f"Command rejected by device (errNo={err_no}): {message_dict}")
+            else:
+                _LOGGER.debug(f"Command response: {message_dict}")
         elif message_type == "info":
             self._handle_info(message_dict)
         elif message_type == "deviceStatusEvent":
@@ -1194,10 +1209,32 @@ class HaierAC(HaierDevice):
         ])
         self.target_temperature = value
 
+    def _get_status_commands(self, turn_on: bool) -> list[dict]:
+        # Power on/off command, with a guaranteed numeric fallback. The value is normally
+        # resolved from the option list, but a device whose firmware reports non-standard
+        # labels (non-Russian / numeric) may have no usable mapping — in that case fall back
+        # to the well-known codes (1=on, 0=off) so the power command is never silently dropped.
+        target = "on" if turn_on else "off"
+        fallback_value = "1" if turn_on else "0"
+        cmds = self.get_commands("status", target)
+        if status_code := self.config['status']:
+            if not cmds or any(c.get("value") in (None, "None") for c in cmds):
+                _LOGGER.warning(
+                    f"status mapping for {target!r} not found on {self.device_name}, "
+                    f"using fallback value {fallback_value!r}"
+                )
+                cmds = self.constraint.apply([{
+                    "commandName": str(status_code),
+                    "value": fallback_value,
+                }])
+        return cmds
+
     def switch_on(self, value: str = None) -> None:
         value = value or self.mode or HVACMode.AUTO
+        # Always send status=on (do not skip on a cached self.status): the cached value can be
+        # stale after an optimistic update or a lost command, which left the AC not turning on.
         self._send_commands([
-            *(self.get_commands("status", "on") if not self.status else []),
+            *self._get_status_commands(turn_on=True),
             *self.get_commands("mode", value),
         ])
         self.status = 1
@@ -1205,7 +1242,7 @@ class HaierAC(HaierDevice):
 
     def switch_off(self) -> None:
         self._send_commands([
-            *self.get_commands("status", "off"),
+            *self._get_status_commands(turn_on=False),
         ])
         self.status = 0
 

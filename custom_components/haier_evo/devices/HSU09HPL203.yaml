@@ -6,6 +6,11 @@ attributes:
     id: "0"
   - name: status
     id: "19"
+    mappings:
+      - haier: "0"
+        value: "off"
+      - haier: "1"
+        value: "on"
   - name: mode
     id: "2"
     mappings:

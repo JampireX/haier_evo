@@ -6,6 +6,11 @@ attributes:
     id: "31"
   - name: status
     id: "21"
+    mappings:
+      - haier: "0"
+        value: "off"
+      - haier: "1"
+        value: "on"
   - name: swing_mode
     id: "8"
     mappings:
