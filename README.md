@@ -1,3 +1,5 @@
+<img src="brand/logo.png" alt="Haier Evo" width="400">
+
 # Haier Evo integration
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs) [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
 
