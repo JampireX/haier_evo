@@ -78,8 +78,14 @@ class HaierREFFridgeModeSensor(HaierREFTemperatureSensor):
         self._attr_translation_key = "ref_fridge_mode"
 
     @property
-    def native_value(self) -> float:
-        return float(getattr(self._device, self._device_attr_name, 0.0))
+    def native_value(self) -> float | None:
+        # fridge_mode/freezer_mode can be None (not yet reported / unsupported) or a
+        # non-numeric label — return None instead of crashing on float(None).
+        value = getattr(self._device, self._device_attr_name, None)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
 
 class HaierREFFreezerModeSensor(HaierREFFridgeModeSensor):
