@@ -731,6 +731,8 @@ class HaierDevice(object):
         self._status_data = backend_data
         # Guards config rebuild (refresh) against concurrent reads from the WS thread.
         self._lock = threading.Lock()
+        # True while a post-rejection refresh is scheduled/running (see on_message).
+        self._reject_refresh_pending = False
 
     def __repr__(self) -> str:
         return (
@@ -830,6 +832,25 @@ class HaierDevice(object):
             self._get_status(data)
         self.write_ha_state()
 
+    def _schedule_refresh_after_rejection(self) -> None:
+        # Called from the WS thread; refresh() is a blocking REST call (API_TIMEOUT=15s)
+        # and must not run here — it would stall ping/pong and message dispatch.
+        if self._reject_refresh_pending:
+            return
+        self._reject_refresh_pending = True
+        threading.Thread(target=self._refresh_after_rejection, daemon=True).start()
+
+    def _refresh_after_rejection(self) -> None:
+        try:
+            time.sleep(C.COMMAND_REJECT_REFRESH_DELAY)
+            self.refresh()
+        except Exception as e:
+            _LOGGER.warning(
+                f"Failed to refresh {self.device_name} after command rejection: {e}"
+            )
+        finally:
+            self._reject_refresh_pending = False
+
     def _set_attribute_value(self, code: str, value: str) -> None:
         pass
 
@@ -912,6 +933,9 @@ class HaierDevice(object):
             err_no = message_dict.get("errNo", 0)
             if err_no not in (0, "0", None):
                 _LOGGER.warning(f"Command rejected by device (errNo={err_no}): {message_dict}")
+                # set_* already applied the value optimistically — re-pull the real
+                # state so HA does not keep showing what the device refused to do.
+                self._schedule_refresh_after_rejection()
             else:
                 _LOGGER.debug(f"Command response: {message_dict}")
         elif message_type == "info":
