@@ -24,6 +24,11 @@ WS_PING_TIMEOUT = 5
 # connection can close a few ms after send() returned (no exception raised), silently
 # losing the command. If the socket is down by then we raise to trigger the retry/resend.
 WS_POST_SEND_CHECK = 0.06
+# After a device rejects a command (command_response with errNo != 0) we re-pull its
+# real state over REST: set_* applied the value optimistically, so HA would otherwise
+# keep showing a state the device refused. The delay lets the cloud settle first and
+# coalesces a burst of rejections (e.g. a group command) into a single refresh.
+COMMAND_REJECT_REFRESH_DELAY = 2.0
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
