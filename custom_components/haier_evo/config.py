@@ -362,6 +362,10 @@ class Attribute(dict):
         return str(item.value) if item is not None else default
 
     def get_item_name(self, code: str, default=None) -> str | None:
+        # Normalize the incoming code the same way Item.value does (true/false -> 1/0),
+        # otherwise an attribute whose raw values are "true"/"false" (e.g. WM status)
+        # would never match the normalized item values and silently resolve to None.
+        code = {"true": "1", "false": "0"}.get(code, code)
         item = next(filter(lambda i: str(i.value) == code, self.list), None)
         return str(item.name) if item is not None else default
 
@@ -519,6 +523,10 @@ class EcoSensor(Item):
 class Temperature(Item):
     def __init__(self, data: dict) -> None:
         description = (data.get("name") or "").strip()
+        # Copy onto the instance first: Temperature has no own `mappings`, so
+        # `self.mappings` is the shared Item.mappings class dict — mutating it would
+        # leak every fridge/freezer temperature label into every other device's mappings.
+        self.mappings = dict(self.mappings)
         self.mappings.setdefault(
             description,
             description.replace("℃", "").strip()
@@ -558,7 +566,7 @@ class Constraint(list):
             for cond_command in cond.get("commands", []):
                 if command_code != cond_command.get("commandName"):
                     continue
-                values = [self.value2code(x) for x in cond_command.get("values")]
+                values = [self.value2code(x) for x in (cond_command.get("values") or [])]
                 if command_value not in values:
                     continue
                 additionals.append(item.get("additionalCommands", {}))

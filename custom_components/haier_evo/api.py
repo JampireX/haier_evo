@@ -1135,9 +1135,15 @@ class HaierAC(HaierDevice):
         self.config.merge_attributes()
         for attr in self.config.attrs:
             self._set_attribute_value(str(attr.code), attr.current)
-            if attr.name == "target_temperature":
-                self.min_temperature = float(attr.range.min_value)
-                self.max_temperature = float(attr.range.max_value)
+            if attr.name == "target_temperature" and attr.range is not None:
+                # The API may omit the range or report non-numeric bounds; guard so a
+                # single odd device does not crash the whole setup (keep the defaults).
+                min_value = parsefloat(attr.range.min_value)
+                max_value = parsefloat(attr.range.max_value)
+                if min_value is not None:
+                    self.min_temperature = min_value
+                if max_value is not None:
+                    self.max_temperature = max_value
             _LOGGER.debug(f"{self.device_name}: {attr}")
         self.constraint.extend(data.setdefault("constraint", []))
 
@@ -1764,5 +1770,12 @@ def parsebool(value) -> bool:
 def parseint(value) -> int | None:
     try:
         return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def parsefloat(value) -> float | None:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
