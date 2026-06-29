@@ -208,6 +208,8 @@ class Haier(object):
         self.disconnect_requested = False
         self.socket_status: SocketStatus = SocketStatus.PRE_INITIALIZATION
         self.socket_thread = None
+        # Monotonic time the current WS session opened (for command/session diagnostics).
+        self._connected_at = None
         self.reset_limits()
         self.register_view()
 
@@ -570,8 +572,10 @@ class Haier(object):
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_open(self, ws: WebSocket) -> None:
         self.socket_status = SocketStatus.INITIALIZED
+        self._connected_at = time.monotonic()
         _LOGGER.debug("Websocket opened")
         for device in self.devices:
+            device.reset_session_state()
             device.init_if_needed()
 
     # noinspection PyUnusedLocal
@@ -733,6 +737,10 @@ class HaierDevice(object):
         self._lock = threading.Lock()
         # True while a post-rejection refresh is scheduled/running (see on_message).
         self._reject_refresh_pending = False
+        # Diagnostics: last value we sent per attribute code, and when this WS session
+        # first received any inbound message (proxy for "cloud attached our session").
+        self._sent_commands: dict[str, dict] = {}
+        self._session_ready_at = None
 
     def __repr__(self) -> str:
         return (
@@ -860,6 +868,7 @@ class HaierDevice(object):
         # Visible at INFO so it is clear whether realtime updates actually arrive and which
         # attributes they carry (the raw "Received WSS message" log is only at DEBUG).
         _LOGGER.info(f"WS status update for {self.device_name}: {properties}")
+        self._log_state_correlation(properties)
         with self._lock:
             for key, value in properties.items():
                 self._set_attribute_value(key, value)
@@ -882,26 +891,99 @@ class HaierDevice(object):
         self._send_group_command(commands)
 
     def _send_group_command(self, commands: list[dict]) -> None:
-        trace = str(uuid.uuid4())
-        _ = self._send_message({
-            "action": "operation",
-            "macAddress": self.device_id,
-            "commandName": self.config.command_name,
-            "commands": commands,
-            "trace": trace,
-        }) if self.config.command_name else [
-            self._send_single_command(c)
-            for c in commands
-        ]
+        if self.config.command_name:
+            trace = str(uuid.uuid4())
+            self._record_sent(commands, trace)
+            self._send_message({
+                "action": "operation",
+                "macAddress": self.device_id,
+                "commandName": self.config.command_name,
+                "commands": commands,
+                "trace": trace,
+            })
+        else:
+            for c in commands:
+                self._send_single_command(c)
 
     def _send_single_command(self, command: dict) -> None:
         trace = str(uuid.uuid4())
+        self._record_sent([command], trace)
         self._send_message({
             "action": "command",
             "macAddress": self.device_id,
             "command": command,
             "trace": trace,
         })
+
+    # --- diagnostics: command / state correlation -----------------------------
+    # These only log; they do not change behaviour. The goal is to confirm whether
+    # the first command is sent before the cloud has attached our session (race),
+    # and whether a later status update reverts a value we just commanded.
+    @staticmethod
+    def _norm_value(value) -> str:
+        return {"true": "1", "false": "0"}.get(str(value), str(value))
+
+    def _session_age(self) -> float | None:
+        started = getattr(self._haier, "_connected_at", None)
+        return (time.monotonic() - started) if started else None
+
+    def reset_session_state(self) -> None:
+        # Called on every (re)connect: readiness is re-evaluated per WS session.
+        self._session_ready_at = None
+
+    def _note_session_ready(self) -> None:
+        if self._session_ready_at is None:
+            self._session_ready_at = time.monotonic()
+            age = self._session_age()
+            when = f"{age:.2f}s after connect" if age is not None else "received"
+            _LOGGER.info(f"WS SESSION READY [{self.device_name}]: first inbound message {when}")
+
+    def _record_sent(self, commands: list[dict], trace: str) -> None:
+        now = time.monotonic()
+        summary = {}
+        for c in commands:
+            code = str(c.get("commandName"))
+            val = self._norm_value(c.get("value"))
+            self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
+            summary[code] = val
+        age = self._session_age()
+        ready = (
+            f"{now - self._session_ready_at:.2f}s ago"
+            if self._session_ready_at else "NOT-READY-YET"
+        )
+        age_s = f"{age:.2f}s" if age is not None else "n/a"
+        _LOGGER.info(
+            f"CMD OUT [{self.device_name}] trace={trace} cmds={summary} "
+            f"session_age={age_s} device_ready={ready}"
+        )
+
+    def _ack_latency(self, trace) -> str:
+        now = time.monotonic()
+        ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
+        return f"{now - ts:.2f}s" if ts is not None else "n/a"
+
+    def _log_state_correlation(self, properties: dict) -> None:
+        if not properties or not self._sent_commands:
+            return
+        now = time.monotonic()
+        for code, info in self._sent_commands.items():
+            if code not in properties:
+                continue
+            dt = now - info["ts"]
+            if dt > C.WS_CMD_CORRELATION_WINDOW:
+                continue
+            got = self._norm_value(properties.get(code))
+            if got == info["value"]:
+                _LOGGER.info(
+                    f"CMD CONFIRMED [{self.device_name}] code={code} value={got} "
+                    f"after {dt:.2f}s (trace={info['trace']})"
+                )
+            else:
+                _LOGGER.warning(
+                    f"STATE REVERT? [{self.device_name}] code={code} we sent "
+                    f"{info['value']} but device now reports {got} after {dt:.2f}s "
+                    f"(trace={info['trace']}) — possible cloud rollback/race"
+                )
 
     def init_if_needed(self) -> None:
         pass
@@ -924,6 +1006,8 @@ class HaierDevice(object):
         }])
 
     def on_message(self, message_dict: dict) -> None:
+        # First inbound on a fresh session marks it "ready" (cloud attached us).
+        self._note_session_ready()
         message_type = message_dict.get("event", "")
         if message_type == "status":
             self._handle_status_update(message_dict)
@@ -931,13 +1015,20 @@ class HaierDevice(object):
             # The device acknowledges every command here; errNo != 0 means it rejected it.
             # Surface rejections at WARNING so a dropped/refused command is easy to diagnose.
             err_no = message_dict.get("errNo", 0)
+            trace = message_dict.get("trace")
+            latency = self._ack_latency(trace)
             if err_no not in (0, "0", None):
-                _LOGGER.warning(f"Command rejected by device (errNo={err_no}): {message_dict}")
+                _LOGGER.warning(
+                    f"CMD REJECTED [{self.device_name}] trace={trace} errNo={err_no} "
+                    f"latency={latency}: {message_dict}"
+                )
                 # set_* already applied the value optimistically — re-pull the real
                 # state so HA does not keep showing what the device refused to do.
                 self._schedule_refresh_after_rejection()
             else:
-                _LOGGER.debug(f"Command response: {message_dict}")
+                _LOGGER.info(
+                    f"CMD ACK [{self.device_name}] trace={trace} errNo=0 latency={latency}"
+                )
         elif message_type == "info":
             self._handle_info(message_dict)
         elif message_type == "deviceStatusEvent":

@@ -29,6 +29,9 @@ WS_POST_SEND_CHECK = 0.06
 # keep showing a state the device refused. The delay lets the cloud settle first and
 # coalesces a burst of rejections (e.g. a group command) into a single refresh.
 COMMAND_REJECT_REFRESH_DELAY = 2.0
+# Diagnostics: how long after sending a command an incoming status update is still
+# correlated with it (to detect confirmations vs. cloud-side rollbacks/races).
+WS_CMD_CORRELATION_WINDOW = 15.0
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
