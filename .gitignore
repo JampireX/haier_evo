@@ -22,6 +22,9 @@ ENV/
 # IDE (JetBrains / IntelliJ IDEA)
 .idea/
 
+# Claude Code
+.claude/
+
 # OS files
 .DS_Store
 Thumbs.db
