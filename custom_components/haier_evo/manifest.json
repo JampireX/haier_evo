@@ -1,7 +1,7 @@
 {
   "domain": "haier_evo",
   "name": "Haier Evo",
-  "codeowners": ["@and7ey"],
+  "codeowners": ["@and7ey", "JampireX"],
   "config_flow": true,
   "dependencies": ["http"],
   "documentation": "https://github.com/and7ey/haier_evo",
@@ -9,6 +9,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/and7ey/haier_evo/issues",
   "requirements": ["requests", "websocket-client", "ratelimit"],
-  "version": "0.3.24",
+  "version": "0.3.25",
   "zeroconf": []
 }
