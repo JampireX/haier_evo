@@ -1,7 +1,7 @@
 {
   "domain": "haier_evo",
   "name": "Haier Evo",
-  "codeowners": ["@and7ey", "JampireX"],
+  "codeowners": ["@and7ey", "@JampireX"],
   "config_flow": true,
   "dependencies": ["http"],
   "documentation": "https://github.com/and7ey/haier_evo",
