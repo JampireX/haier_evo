@@ -871,6 +871,12 @@ class HaierDevice(object):
         self._log_state_correlation(properties)
         with self._lock:
             for key, value in properties.items():
+                # A status snapshot that arrives right after (re)connect still carries the
+                # PRE-command state and would revert the optimistic value in the UI while
+                # the command is still in flight. Skip values that contradict a recently
+                # sent, not-yet-confirmed command (see _should_suppress_stale).
+                if self._should_suppress_stale(key, value):
+                    continue
                 self._set_attribute_value(key, value)
         self.available = True
         self.write_ha_state()
@@ -962,6 +968,46 @@ class HaierDevice(object):
         ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
         return f"{now - ts:.2f}s" if ts is not None else "n/a"
 
+    @classmethod
+    def _values_equal(cls, a, b) -> bool:
+        a, b = cls._norm_value(a), cls._norm_value(b)
+        if a == b:
+            return True
+        # The cloud may report numbers formatted differently from what we sent
+        # (e.g. "24" vs "24.0") — compare numerically when both parse.
+        try:
+            return float(a) == float(b)
+        except (TypeError, ValueError):
+            return False
+
+    def _should_suppress_stale(self, code: str, value) -> bool:
+        # True when an inbound status value must NOT be applied because it contradicts a
+        # command we sent within WS_CMD_CORRELATION_WINDOW that the device has not yet
+        # confirmed. Once the device reports the commanded value, the pending entry is
+        # dropped and updates for that attribute flow normally again.
+        info = self._sent_commands.get(str(code))
+        if not info:
+            return False
+        dt = time.monotonic() - info["ts"]
+        if dt > C.WS_CMD_CORRELATION_WINDOW:
+            self._sent_commands.pop(str(code), None)
+            return False
+        if self._values_equal(value, info["value"]):
+            self._sent_commands.pop(str(code), None)
+            return False
+        _LOGGER.warning(
+            f"STALE STATUS SUPPRESSED [{self.device_name}] code={code}: device reports "
+            f"{self._norm_value(value)} but we sent {info['value']} {dt:.2f}s ago "
+            f"(trace={info['trace']}) — keeping the optimistic value until confirmation"
+        )
+        return True
+
+    def _clear_sent_by_trace(self, trace) -> None:
+        # After an explicit rejection the optimistic value is wrong — stop protecting it
+        # so the follow-up refresh() can restore the real device state in the UI.
+        for code in [c for c, v in self._sent_commands.items() if v["trace"] == trace]:
+            self._sent_commands.pop(code, None)
+
     def _log_state_correlation(self, properties: dict) -> None:
         if not properties or not self._sent_commands:
             return
@@ -1024,6 +1070,7 @@ class HaierDevice(object):
                 )
                 # set_* already applied the value optimistically — re-pull the real
                 # state so HA does not keep showing what the device refused to do.
+                self._clear_sent_by_trace(trace)
                 self._schedule_refresh_after_rejection()
             else:
                 _LOGGER.info(
