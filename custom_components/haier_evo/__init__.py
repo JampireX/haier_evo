@@ -3,7 +3,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
 from homeassistant.loader import async_get_integration
-from .logger import _LOGGER, setup_file_logging
+from .logger import _LOGGER
 from .const import DOMAIN
 from . import api
 
@@ -18,7 +18,6 @@ PLATFORMS: list[str] = [
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    await hass.async_add_executor_job(setup_file_logging, hass.config.path("haier_evo.log"))
     integration = await async_get_integration(hass, DOMAIN)
     _LOGGER.debug(f'Integration version: {integration.version}')
     username = entry.data.get("email") or ""
