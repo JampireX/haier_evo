@@ -3,12 +3,12 @@
   "name": "Haier Evo",
   "codeowners": ["@and7ey", "@JampireX"],
   "config_flow": true,
-  "dependencies": ["http"],
+  "dependencies": ["http", "frontend"],
   "documentation": "https://github.com/and7ey/haier_evo",
   "homekit": {},
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/and7ey/haier_evo/issues",
   "requirements": ["requests", "websocket-client", "ratelimit"],
-  "version": "0.3.26-beta.5",
+  "version": "0.3.26-beta.6",
   "zeroconf": []
 }
