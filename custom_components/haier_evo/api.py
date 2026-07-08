@@ -779,6 +779,9 @@ class HaierDevice(object):
         # first received any inbound message (proxy for "cloud attached our session").
         self._sent_commands: dict[str, dict] = {}
         self._session_ready_at = None
+        # True once a full status snapshot (all attributes at once) has been received
+        # over WS — see init_if_needed/_init_snapshot_fallback.
+        self._snapshot_seen = False
 
     def __repr__(self) -> str:
         return (
@@ -903,6 +906,8 @@ class HaierDevice(object):
     def _handle_status_update(self, received_message: dict) -> None:
         statuses = received_message.get("payload", {}).get("statuses") or [{}]
         properties = (statuses[0] or {}).get("properties") or {}
+        if len(properties) >= C.WS_FULL_SNAPSHOT_MIN_PROPS:
+            self._snapshot_seen = True
         # Visible at INFO so it is clear whether realtime updates actually arrive and which
         # attributes they carry (the raw "Received WSS message" log is only at DEBUG).
         _LOGGER.info(f"WS status update for {self.device_name}: {properties}")
@@ -1332,12 +1337,36 @@ class HaierAC(HaierDevice):
         return data
 
     def init_if_needed(self) -> None:
-        if not self._inited and next(filter(
+        if self._inited:
+            return
+        self._inited = True
+        if next(filter(
             lambda a: (not a.name.startswith("preset_mode_") and a.current is None),
             self.config.attrs
-        ), None) is not None:
-            self.set_temperature(self.target_temperature)
-        self._inited = True
+        ), None) is None:
+            return
+        # Some attribute values are missing from the REST config (swing, light, health);
+        # they only come in a full WS status snapshot, which the cloud pushes on its own
+        # shortly after the session opens. Previously a target-temperature command was
+        # sent here to force that snapshot — but any operation command makes the AC beep,
+        # the cloud occasionally rejects it (errNo=-1), and the snapshot arrives (or not)
+        # regardless of it. So: just wait, and fall back to a silent REST refresh.
+        threading.Thread(target=self._init_snapshot_fallback, daemon=True).start()
+
+    def _init_snapshot_fallback(self) -> None:
+        time.sleep(C.WS_INIT_SNAPSHOT_TIMEOUT)
+        if self._snapshot_seen:
+            return
+        _LOGGER.info(
+            f"No full status snapshot within {C.WS_INIT_SNAPSHOT_TIMEOUT}s after connect "
+            f"for {self.device_name} — refreshing over REST instead"
+        )
+        try:
+            self.refresh()
+        except Exception as e:
+            _LOGGER.warning(
+                f"Failed to refresh {self.device_name} after missing snapshot: {e}"
+            )
 
     def get_commands(self, name: str, value: str | bool) -> list[dict]:
         if name != "preset_mode":
