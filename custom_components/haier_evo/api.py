@@ -210,6 +210,8 @@ class Haier(object):
         self.socket_thread = None
         # Monotonic time the current WS session opened (for command/session diagnostics).
         self._connected_at = None
+        # Monotonic time of the last inbound WS message (any device) — see _is_session_stale.
+        self._last_inbound_at = None
         self.reset_limits()
         self.register_view()
 
@@ -560,6 +562,7 @@ class Haier(object):
 
     # noinspection PyUnusedLocal
     def _on_message(self, ws: WebSocket, message: str) -> None:
+        self._last_inbound_at = time.monotonic()
         _LOGGER.debug(f"Received WSS message: {message}")
         message_dict: dict = json.loads(message)
         message_device = str(message_dict.get("macAddress")).lower()
@@ -625,6 +628,32 @@ class Haier(object):
         # Ready to send only when both signals agree: the status flag is INITIALIZED
         # (set by _on_open / cleared by _on_close) and the underlying sock is connected.
         return self.socket_status == SocketStatus.INITIALIZED and self.is_socket_connected()
+
+    def _is_session_stale(self) -> bool:
+        # Zombie-session detector: the socket passes ping/pong but the server has not
+        # delivered a single application message for a long time — a command sent into
+        # such a session is likely to be silently lost.
+        last_activity = max(
+            (t for t in (self._last_inbound_at, self._connected_at) if t is not None),
+            default=None,
+        )
+        if last_activity is None:
+            return False
+        return (time.monotonic() - last_activity) > C.WS_SESSION_STALE_TIMEOUT
+
+    def _force_reconnect(self) -> None:
+        # Closing the socket makes run_forever() return; the connect() loop in the
+        # socket thread then re-establishes the session (refreshing the token).
+        try:
+            self.socket_app.close()
+        except Exception as e:
+            _LOGGER.debug(f"Error closing stale socket: {e}")
+        # _on_close fires asynchronously; wait until the stale INITIALIZED state is
+        # gone so the follow-up connect_if_needed() waits for the NEW session instead
+        # of returning immediately on the old one.
+        deadline = time.monotonic() + 1.0
+        while self._is_socket_ready() and time.monotonic() < deadline:
+            time.sleep(0.05)
 
     def connect_if_needed(self, timeout: float = 4.0) -> None:
         if self.socket_thread and self.socket_thread.is_alive():
@@ -694,6 +723,15 @@ class Haier(object):
                 self.connect_if_needed()
                 if not self._is_socket_ready():
                     raise ConnectionError("Socket not ready after reconnect attempt")
+            elif self._is_session_stale():
+                _LOGGER.warning(
+                    f"WS session stale: no inbound messages for over "
+                    f"{C.WS_SESSION_STALE_TIMEOUT}s — reconnecting before send"
+                )
+                self._force_reconnect()
+                self.connect_if_needed()
+                if not self._is_socket_ready():
+                    raise ConnectionError("Socket not ready after stale-session reconnect")
             _LOGGER.info(f"Sending message: {payload}")
             try:
                 self.socket_app.send(payload)
@@ -1019,17 +1057,14 @@ class HaierDevice(object):
             if dt > C.WS_CMD_CORRELATION_WINDOW:
                 continue
             got = self._norm_value(properties.get(code))
-            if got == info["value"]:
+            if self._values_equal(got, info["value"]):
                 _LOGGER.info(
                     f"CMD CONFIRMED [{self.device_name}] code={code} value={got} "
                     f"after {dt:.2f}s (trace={info['trace']})"
                 )
-            else:
-                _LOGGER.warning(
-                    f"STATE REVERT? [{self.device_name}] code={code} we sent "
-                    f"{info['value']} but device now reports {got} after {dt:.2f}s "
-                    f"(trace={info['trace']}) — possible cloud rollback/race"
-                )
+            # A mismatch is not logged here: the same value goes through
+            # _should_suppress_stale right after, which logs it exactly once
+            # (STALE STATUS SUPPRESSED) and keeps the optimistic value.
 
     def init_if_needed(self) -> None:
         pass

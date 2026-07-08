@@ -32,6 +32,11 @@ COMMAND_REJECT_REFRESH_DELAY = 2.0
 # Diagnostics: how long after sending a command an incoming status update is still
 # correlated with it (to detect confirmations vs. cloud-side rollbacks/races).
 WS_CMD_CORRELATION_WINDOW = 15.0
+# "Zombie" WS session guard: ping/pong keeps the TCP connection alive, but the server can
+# silently stop delivering application messages (observed: a 10.7h-old session with zero
+# inbound messages — the first command sent into it was lost). If nothing has been received
+# for this long, the session is torn down and re-established before sending a command.
+WS_SESSION_STALE_TIMEOUT = 30 * 60
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
