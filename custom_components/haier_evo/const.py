@@ -37,6 +37,14 @@ WS_CMD_CORRELATION_WINDOW = 15.0
 # inbound messages — the first command sent into it was lost). If nothing has been received
 # for this long, the session is torn down and re-established before sending a command.
 WS_SESSION_STALE_TIMEOUT = 30 * 60
+# On (re)connect the cloud pushes a full status snapshot on its own; if it has not arrived
+# within this many seconds after the first connect, the device state is refreshed over REST
+# instead. (Previously a target-temperature command was sent to force the snapshot — but any
+# operation command makes an AC beep, and the snapshot arrives regardless of it.)
+WS_INIT_SNAPSHOT_TIMEOUT = 10.0
+# A status message carrying at least this many properties is treated as a full snapshot
+# (incremental updates carry 1-2 properties, full snapshots ~30).
+WS_FULL_SNAPSHOT_MIN_PROPS = 10
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
