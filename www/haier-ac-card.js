@@ -67,7 +67,9 @@ class HaierAcCard extends HTMLElement {
       throw new Error("Укажите climate-сущность: entity: climate.xxx");
     }
     this._config = config;
-    this._root = this.attachShadow({ mode: "open" });
+    // setConfig can be called again on the same element (card editor / config change);
+    // attachShadow throws if a shadow root already exists, so reuse it.
+    this._root = this.shadowRoot || this.attachShadow({ mode: "open" });
     this._built = false;
   }
 
@@ -228,7 +230,8 @@ class HaierAcCard extends HTMLElement {
     const e = this._entity();
     if (!e) return;
     const a = e.attributes;
-    const on = e.state !== "off";
+    // "unavailable"/"unknown" are NOT powered-on states — only a real HVAC mode is.
+    const on = e.state !== "off" && e.state !== "unavailable" && e.state !== "unknown";
     const modeKey = on ? e.state : "off";
     const m = MODE[modeKey] || MODE.off;
     const card = this._root.querySelector(".card");
@@ -251,7 +254,8 @@ class HaierAcCard extends HTMLElement {
     // gauge
     const tgt = a.temperature;
     const lo = a.min_temp ?? 16, hi = a.max_temp ?? 30;
-    const frac = tgt != null ? Math.min(1, Math.max(0, (tgt - lo) / (hi - lo))) : 0;
+    const span = hi - lo;
+    const frac = (tgt != null && span > 0) ? Math.min(1, Math.max(0, (tgt - lo) / span)) : 0;
     const g = this._gauge;
     const end = g.A0 + frac * g.SPAN;
     this._root.getElementById("prog").setAttribute("d", arcPath(g.cx, g.cy, g.r, g.A0, on ? end : g.A0 + 0.001));
@@ -345,6 +349,9 @@ class HaierAcCard extends HTMLElement {
     wrap.style.display = (list && list.length) ? "" : "none";
     if (!list || !list.length) return;
     const el = this._root.getElementById(id);
+    // When disabled (AC off) show it as such instead of silently swallowing taps.
+    el.style.opacity = enabled ? "" : "0.45";
+    el.style.pointerEvents = enabled ? "" : "none";
     el.innerHTML = list.map((v) =>
       `<button class="${v === current ? "active" : ""}" data-v="${v}">${label(v)}</button>`).join("");
     el.querySelectorAll("button").forEach((b) =>

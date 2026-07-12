@@ -29,9 +29,14 @@ WS_POST_SEND_CHECK = 0.06
 # keep showing a state the device refused. The delay lets the cloud settle first and
 # coalesces a burst of rejections (e.g. a group command) into a single refresh.
 COMMAND_REJECT_REFRESH_DELAY = 2.0
-# Diagnostics: how long after sending a command an incoming status update is still
-# correlated with it (to detect confirmations vs. cloud-side rollbacks/races).
-WS_CMD_CORRELATION_WINDOW = 15.0
+# How long after actually sending a command an incoming status update is still correlated
+# with it — used both to log confirmations and to SUPPRESS a stale pre-command snapshot that
+# would otherwise revert the optimistic value ("rolls back to off"). Must comfortably exceed
+# the worst-case reconnect + cloud-attach + ack latency: observed up to ~15s (first inbound
+# ~11s after a stale-session reconnect, ack ~15s), so 15s was dangerously tight. The window
+# is measured from the REAL send time (see _touch_sent), not from the CMD OUT log line which
+# precedes a possible multi-second reconnect.
+WS_CMD_CORRELATION_WINDOW = 45.0
 # "Zombie" WS session guard: ping/pong keeps the TCP connection alive, but the server can
 # silently stop delivering application messages (observed: a 10.7h-old session with zero
 # inbound messages — the first command sent into it was lost). If nothing has been received
