@@ -281,7 +281,15 @@ class Haier(object):
         self.http.haier = weakref.proxy(self)
 
     def unregister_view(self) -> None:
-        self.http.haier = None
+        # The debug view is a class-level singleton bound to a single URL, so all config
+        # entries share it. Only detach if it still points at us — otherwise unloading one
+        # entry would break the endpoint for another entry that is still running.
+        try:
+            current = self.http.haier
+            if current is None or current == self:
+                self.http.haier = None
+        except ReferenceError:
+            self.http.haier = None
 
     def stop(self) -> None:
         self.disconnect_requested = True
@@ -395,7 +403,11 @@ class Haier(object):
         except AuthValidationError as e:
             raise e
         except AssertionError as e:
+            # A 5xx error body has no token, so resp.access_token/… assert here. login() is
+            # only called with an expired/absent token, so there is nothing valid to fall back
+            # on — surface the failure instead of pretending auth succeeded with an empty token.
             _LOGGER.error(f"Assertion error: {e}")
+            raise InvalidAuth()
         except Exception as e:
             _LOGGER.error(
                 f"Failed to login/refresh token, "
@@ -506,13 +518,19 @@ class Haier(object):
                 device_mac = query_params.get('deviceId', [''])[0]
                 device_mac = device_mac.replace('%3A', ':')
                 device_serial = query_params.get('serialNum', [''])[0]
-                device = HaierDevice.create(
-                    haier=self,
-                    device_type=device_type,
-                    device_mac=device_mac,
-                    device_serial=device_serial,
-                    device_title=device_title,
-                )
+                try:
+                    device = HaierDevice.create(
+                        haier=self,
+                        device_type=device_type,
+                        device_mac=device_mac,
+                        device_serial=device_serial,
+                        device_title=device_title,
+                    )
+                except Exception as e:
+                    # One appliance failing to fetch/parse (e.g. its status endpoint 5xx-es)
+                    # must not abort discovery of the others.
+                    _LOGGER.error(f"Failed to add device {device_mac!r} ({device_title!r}): {e}")
+                    continue
                 self.devices.append(device)
                 _LOGGER.info(f"Added device: {device}")
         if len(self.devices) > 0:
@@ -954,6 +972,7 @@ class HaierDevice(object):
                 "commands": commands,
                 "trace": trace,
             })
+            self._touch_sent(trace)
         else:
             for c in commands:
                 self._send_single_command(c)
@@ -967,6 +986,7 @@ class HaierDevice(object):
             "command": command,
             "trace": trace,
         })
+        self._touch_sent(trace)
 
     # --- diagnostics: command / state correlation -----------------------------
     # These only log; they do not change behaviour. The goal is to confirm whether
@@ -1010,6 +1030,18 @@ class HaierDevice(object):
             f"CMD OUT [{self.device_name}] trace={trace} cmds={summary} "
             f"session_age={age_s} device_ready={ready}"
         )
+
+    def _touch_sent(self, trace) -> None:
+        # Re-stamp the correlation timestamp to the moment the command actually left the
+        # socket. _record_sent runs BEFORE _send_message, which may block for a full
+        # stale-session reconnect (observed multi-second) — without this the suppression
+        # window would start counting from before the command was even on the wire, so a
+        # slow reconnect could let the stale pre-command snapshot revert the value.
+        now = time.monotonic()
+        with self._sent_lock:
+            for v in self._sent_commands.values():
+                if v["trace"] == trace:
+                    v["ts"] = now
 
     def _ack_latency(self, trace) -> str:
         now = time.monotonic()
@@ -1269,11 +1301,14 @@ class HaierAC(HaierDevice):
         if not (attr and value is not None):
             return
         elif attr.name == "current_temperature":
-            self.current_temperature = float(value)
+            if (v := parsefloat(value)) is not None:
+                self.current_temperature = v
         elif attr.name == "status":
-            self.status = int(value)
+            if (v := parseint(value)) is not None:
+                self.status = v
         elif attr.name == "target_temperature":
-            self.target_temperature = float(value)
+            if (v := parsefloat(value)) is not None:
+                self.target_temperature = v
         elif attr.name == "mode":
             self.mode = attr.get_item_name(value)
         elif attr.name == "fan_mode":
@@ -1666,11 +1701,14 @@ class HaierREF(HaierDevice):
         if not (attr and value is not None):
             return
         elif attr.name == "current_fridge_temperature":
-            self.current_fridge_temperature = float(value)
+            if (v := parsefloat(value)) is not None:
+                self.current_fridge_temperature = v
         elif attr.name == "current_freezer_temperature":
-            self.current_freezer_temperature = float(value)
+            if (v := parsefloat(value)) is not None:
+                self.current_freezer_temperature = v
         elif attr.name == "current_temperature":
-            self.current_temperature = float(value)
+            if (v := parsefloat(value)) is not None:
+                self.current_temperature = v
         elif attr.name == "fridge_mode":
             self.fridge_mode = attr.get_item_name(value)
         elif attr.name == "freezer_mode":
@@ -1699,31 +1737,37 @@ class HaierREF(HaierDevice):
         if commands := self.get_commands("super_cooling", value):
             self._send_single_command(commands[0])
             self.super_cooling = value
+            self.write_ha_state()
 
     def set_super_freeze(self, value: bool) -> None:
         if commands := self.get_commands("super_freeze", value):
             self._send_single_command(commands[0])
             self.super_freeze = value
+            self.write_ha_state()
 
     def set_vacation_mode(self, value: bool) -> None:
         if commands := self.get_commands("vacation_mode", value):
             self._send_single_command(commands[0])
             self.vacation_mode = value
+            self.write_ha_state()
 
     def set_fridge_mode(self, value: str) -> None:
         if commands := self.get_commands("fridge_mode", value):
             self._send_single_command(commands[0])
             self.fridge_mode = value
+            self.write_ha_state()
 
     def set_freezer_mode(self, value: str) -> None:
         if commands := self.get_commands("freezer_mode", value):
             self._send_single_command(commands[0])
             self.freezer_mode = value
+            self.write_ha_state()
 
     def set_my_zone(self, value: str) -> None:
         if commands := self.get_commands("my_zone", value):
             self._send_single_command(commands[0])
             self.my_zone = value
+            self.write_ha_state()
 
     def create_entities_switch(self) -> list:
         from . import switch
@@ -1924,23 +1968,27 @@ class HaierWM(HaierDevice):
             if program["commands"]:
                 self._send_commands(program["commands"])
                 self.program = value
+                self.write_ha_state()
             return
         # fallback: a single attribute from YAML
         if commands := self.get_commands("program", value):
             self._send_single_command(commands[0])
             self.program = value
+            self.write_ha_state()
 
     def set_temperature(self, value: str) -> None:
         self._ensure_remote_control()
         if commands := self.get_commands("temperature", value):
             self._send_single_command(commands[0])
             self.temperature = value
+            self.write_ha_state()
 
     def set_spin_speed(self, value: str) -> None:
         self._ensure_remote_control()
         if commands := self.get_commands("spin_speed", value):
             self._send_single_command(commands[0])
             self.spin_speed = value
+            self.write_ha_state()
 
     def create_entities_select(self) -> list:
         from . import select
