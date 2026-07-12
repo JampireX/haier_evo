@@ -778,6 +778,10 @@ class HaierDevice(object):
         # Diagnostics: last value we sent per attribute code, and when this WS session
         # first received any inbound message (proxy for "cloud attached our session").
         self._sent_commands: dict[str, dict] = {}
+        # Guards _sent_commands: it is written from HA executor threads (_record_sent)
+        # and read/mutated from the WS thread (correlation/suppression/ack). Lock ordering
+        # is always self._lock -> self._sent_lock (never the reverse) to avoid deadlock.
+        self._sent_lock = threading.Lock()
         self._session_ready_at = None
         # True once a full status snapshot (all attributes at once) has been received
         # over WS — see init_if_needed/_init_snapshot_fallback.
@@ -990,11 +994,12 @@ class HaierDevice(object):
     def _record_sent(self, commands: list[dict], trace: str) -> None:
         now = time.monotonic()
         summary = {}
-        for c in commands:
-            code = str(c.get("commandName"))
-            val = self._norm_value(c.get("value"))
-            self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
-            summary[code] = val
+        with self._sent_lock:
+            for c in commands:
+                code = str(c.get("commandName"))
+                val = self._norm_value(c.get("value"))
+                self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
+                summary[code] = val
         age = self._session_age()
         ready = (
             f"{now - self._session_ready_at:.2f}s ago"
@@ -1008,7 +1013,8 @@ class HaierDevice(object):
 
     def _ack_latency(self, trace) -> str:
         now = time.monotonic()
-        ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
+        with self._sent_lock:
+            ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
         return f"{now - ts:.2f}s" if ts is not None else "n/a"
 
     @classmethod
@@ -1028,16 +1034,14 @@ class HaierDevice(object):
         # command we sent within WS_CMD_CORRELATION_WINDOW that the device has not yet
         # confirmed. Once the device reports the commanded value, the pending entry is
         # dropped and updates for that attribute flow normally again.
-        info = self._sent_commands.get(str(code))
-        if not info:
-            return False
-        dt = time.monotonic() - info["ts"]
-        if dt > C.WS_CMD_CORRELATION_WINDOW:
-            self._sent_commands.pop(str(code), None)
-            return False
-        if self._values_equal(value, info["value"]):
-            self._sent_commands.pop(str(code), None)
-            return False
+        with self._sent_lock:
+            info = self._sent_commands.get(str(code))
+            if not info:
+                return False
+            dt = time.monotonic() - info["ts"]
+            if dt > C.WS_CMD_CORRELATION_WINDOW or self._values_equal(value, info["value"]):
+                self._sent_commands.pop(str(code), None)
+                return False
         _LOGGER.warning(
             f"STALE STATUS SUPPRESSED [{self.device_name}] code={code}: device reports "
             f"{self._norm_value(value)} but we sent {info['value']} {dt:.2f}s ago "
@@ -1048,14 +1052,17 @@ class HaierDevice(object):
     def _clear_sent_by_trace(self, trace) -> None:
         # After an explicit rejection the optimistic value is wrong — stop protecting it
         # so the follow-up refresh() can restore the real device state in the UI.
-        for code in [c for c, v in self._sent_commands.items() if v["trace"] == trace]:
-            self._sent_commands.pop(code, None)
+        with self._sent_lock:
+            for code in [c for c, v in self._sent_commands.items() if v["trace"] == trace]:
+                self._sent_commands.pop(code, None)
 
     def _log_state_correlation(self, properties: dict) -> None:
-        if not properties or not self._sent_commands:
+        if not properties:
             return
         now = time.monotonic()
-        for code, info in self._sent_commands.items():
+        with self._sent_lock:
+            snapshot = list(self._sent_commands.items())
+        for code, info in snapshot:
             if code not in properties:
                 continue
             dt = now - info["ts"]
