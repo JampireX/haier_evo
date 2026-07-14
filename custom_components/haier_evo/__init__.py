@@ -1,13 +1,15 @@
 from __future__ import annotations
 from pathlib import Path
+from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
 from homeassistant.loader import async_get_integration
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.helpers.event import async_track_time_interval
 from .logger import _LOGGER
-from .const import DOMAIN
+from .const import DOMAIN, WS_HEARTBEAT_INTERVAL
 from . import api
 
 
@@ -45,6 +47,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.async_add_executor_job(haier_object.load_tokens)
     await hass.async_add_executor_job(haier_object.pull_data)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Background heartbeat: reconnect a stale/zombie WS session and re-pull state over REST,
+    # so devices the user only observes (e.g. an idle washing machine) keep updating instead
+    # of silently freezing. Runs off the event loop; auto-cancelled on unload.
+    async def _heartbeat(now) -> None:
+        await hass.async_add_executor_job(haier_object.heartbeat)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _heartbeat, timedelta(seconds=WS_HEARTBEAT_INTERVAL))
+    )
     return True
 
 

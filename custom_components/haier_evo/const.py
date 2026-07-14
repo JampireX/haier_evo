@@ -42,6 +42,10 @@ WS_CMD_CORRELATION_WINDOW = 45.0
 # inbound messages — the first command sent into it was lost). If nothing has been received
 # for this long, the session is torn down and re-established before sending a command.
 WS_SESSION_STALE_TIMEOUT = 30 * 60
+# How often the background heartbeat runs (see __init__.async_setup_entry): it reconnects a
+# stale/zombie WS session and re-pulls device state over REST, so a device the user only
+# observes (e.g. an idle washing machine) does not silently freeze on stale realtime data.
+WS_HEARTBEAT_INTERVAL = 5 * 60
 # On (re)connect the cloud pushes a full status snapshot on its own; if it has not arrived
 # within this many seconds after the first connect, the device state is refreshed over REST
 # instead. (Previously a target-temperature command was sent to force the snapshot — but any
