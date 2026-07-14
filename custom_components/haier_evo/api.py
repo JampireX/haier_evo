@@ -700,6 +700,33 @@ class Haier(object):
         thread.daemon = True
         thread.start()
 
+    def heartbeat(self) -> None:
+        # Called periodically off the event loop (see __init__.async_setup_entry). Realtime
+        # state arrives only via WS push, and a long-idle session can go "zombie" (ping/pong
+        # keeps TCP alive but the server stops delivering app messages), so a device the user
+        # only observes — e.g. a washing machine left idle — silently stops updating. This
+        # watchdog: (1) restarts a dead socket thread; (2) force-reconnects a stale/zombie
+        # session so the cloud pushes a fresh snapshot and realtime resumes; (3) re-pulls
+        # state over REST every tick as a fallback so values never freeze for longer than
+        # the heartbeat interval even if push has not yet resumed.
+        if self.disconnect_requested:
+            return
+        try:
+            if self.socket_thread is None or not self.socket_thread.is_alive():
+                _LOGGER.info("heartbeat: socket thread not alive — starting a new connection")
+                self.connect_in_thread()
+            elif self._is_session_stale():
+                _LOGGER.info(
+                    "heartbeat: WS session stale — forcing reconnect to resume realtime updates"
+                )
+                self._force_reconnect()
+        except Exception as e:
+            _LOGGER.warning(f"heartbeat reconnect check failed: {e}")
+        try:
+            self.refresh_devices(force=True)
+        except Exception as e:
+            _LOGGER.warning(f"heartbeat refresh failed: {e}")
+
     @connect_limits.sleep_and_retry
     @connect_limits
     def run_forever(self) -> None:
