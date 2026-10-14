@@ -3,13 +3,13 @@ from homeassistant.components.climate import ClimateEntity
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.components.climate.const import HVACMode
-from .const import DOMAIN
 from .logger import _LOGGER
 from . import api
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
-    haier_object = hass.data[DOMAIN][config_entry.entry_id]
+    haier_object = config_entry.runtime_data
+    haier_object.register_platform("climate", async_add_entities)
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_climate())
@@ -39,7 +39,11 @@ class HaierACEntity(ClimateEntity):
         # https://developers.home-assistant.io/blog/2024/01/24/climate-climateentityfeatures-expanded/
         self._enable_turn_on_off_backwards_compatibility = False
 
-        device.add_write_ha_state_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Subscribe only once HA has added the entity: a disabled entity is never added (its
+        # hass stays None), so writing its state on every update would raise RuntimeError.
+        self.async_on_remove(self._device.add_write_ha_state_callback(self.async_write_ha_state))
 
     @property
     def hvac_mode(self) -> str:
@@ -65,7 +69,7 @@ class HaierACEntity(ClimateEntity):
         return self._device.fan_mode
 
     @property
-    def temperature_unit(self) -> str:
+    def native_temperature_unit(self) -> str:
         return UnitOfTemperature.CELSIUS
 
     @property
@@ -77,12 +81,19 @@ class HaierACEntity(ClimateEntity):
         return self._device.min_temperature
 
     @property
-    def current_temperature(self) -> float:
+    def native_current_temperature(self) -> float:
         return self._device.current_temperature
 
     @property
-    def target_temperature(self) -> float:
+    def native_target_temperature(self) -> float:
         return self._device.target_temperature
+
+    # HA 2026.11 renamed these to native_* (the old names stop working in 2027.11); older HA
+    # (down to the 2024.12 minimum) only knows the old names. Providing both keeps the entity
+    # working everywhere and HA uses the native ones without a deprecation warning.
+    temperature_unit = native_temperature_unit
+    current_temperature = native_current_temperature
+    target_temperature = native_target_temperature
 
     @property
     def target_temperature_step(self) -> float:

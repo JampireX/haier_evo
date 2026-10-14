@@ -66,13 +66,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password = entry.data.get("password") or ""
     region = entry.data.get("region") or "ru"
     haier_object = api.Haier(hass, username, password, region, entry_id=entry.entry_id)
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = haier_object
     try:
         await hass.async_add_executor_job(haier_object.load_tokens)
         await hass.async_add_executor_job(haier_object.pull_data)
     except Exception as e:
         # Release the half-initialised object, so a retry starts from scratch.
-        hass.data[DOMAIN].pop(entry.entry_id, None)
         haier_object.stop()
         if isinstance(e, api.InvalidCredentials):
             raise ConfigEntryAuthFailed(str(e)) from e
@@ -90,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     haier_object.on_auth_failed = lambda: hass.loop.call_soon_threadsafe(
         entry.async_start_reauth, hass
     )
+    entry.runtime_data = haier_object
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Background heartbeat: reconnect a stale/zombie WS session and re-pull state over REST,
@@ -107,7 +106,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        haier_object = hass.data[DOMAIN].pop(entry.entry_id)
+        haier_object = entry.runtime_data
         _LOGGER.debug(f'Integration {haier_object} unload...')
         haier_object.stop()
     return unload_ok

@@ -6,7 +6,8 @@ from . import api
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
-    haier_object = hass.data[DOMAIN][config_entry.entry_id]
+    haier_object = config_entry.runtime_data
+    haier_object.register_platform("switch", async_add_entities)
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_switch())
@@ -26,7 +27,10 @@ class HaierSwitch(SwitchEntity):
         self._device = weakref.proxy(device)
         self._device_attr_name = None
 
-        device.add_write_ha_state_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Subscribe only once added: a disabled entity is never added (hass stays None).
+        self.async_on_remove(self._device.add_write_ha_state_callback(self.async_write_ha_state))
 
     @property
     def device_info(self) -> dict:
