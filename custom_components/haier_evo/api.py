@@ -7,6 +7,7 @@ import threading
 import uuid
 import socket
 import weakref
+from collections.abc import Callable
 from aiohttp import web
 from enum import Enum
 from datetime import datetime, timezone, timedelta
@@ -17,7 +18,7 @@ from urllib.parse import urlparse, urljoin, parse_qs
 from urllib3.exceptions import NewConnectionError
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACMode, SWING_OFF, PRESET_NONE
 from homeassistant.components.http import HomeAssistantView
 from .logger import _LOGGER
@@ -219,6 +220,10 @@ class Haier(object):
         self._ws_token = None
         # Called from a worker thread when the server rejects the email/password at runtime.
         self.on_auth_failed = None
+        # Devices whose REST config failed during setup: heartbeat() retries them and adds
+        # their entities on the fly through the platforms' async_add_entities.
+        self._pending_devices: list[dict] = []
+        self._platform_add_entities: dict[str, Callable] = {}
         self.socket_app: WebSocketApp | None = None
         self.disconnect_requested = False
         self.socket_status: SocketStatus = SocketStatus.PRE_INITIALIZATION
@@ -234,7 +239,8 @@ class Haier(object):
         return {
             "socket_status": getattr(self.socket_status, "value", None),
             "backend_data": self._pull_data,
-            "devices": [device.to_dict() for device in self.devices]
+            "devices": [device.to_dict() for device in self.devices],
+            "pending_devices": [p["spec"] for p in self._pending_devices],
         }
 
     @staticmethod
@@ -346,7 +352,12 @@ class Haier(object):
         self.disconnect_requested = True
         self.reset_limits()
         if self.socket_app is not None:
-            self.socket_app.close()
+            try:
+                self.socket_app.close()
+            except Exception as e:
+                # e.g. websocket-client 1.9.1 raised AttributeError here when the WS thread
+                # cleared the socket mid-close — unloading the entry must not fail because of it.
+                _LOGGER.debug(f"Error closing websocket: {e!r}")
         self.unregister_view()
 
     @common_limits.sleep_and_retry
@@ -594,23 +605,60 @@ class Haier(object):
                 device_mac = query_params.get('deviceId', [''])[0]
                 device_mac = device_mac.replace('%3A', ':')
                 device_serial = query_params.get('serialNum', [''])[0]
+                spec = dict(
+                    device_type=device_type,
+                    device_mac=device_mac,
+                    device_serial=device_serial,
+                    device_title=device_title,
+                )
                 try:
-                    device = HaierDevice.create(
-                        haier=self,
-                        device_type=device_type,
-                        device_mac=device_mac,
-                        device_serial=device_serial,
-                        device_title=device_title,
-                    )
+                    device = HaierDevice.create(haier=self, **spec)
                 except Exception as e:
                     # One appliance failing to fetch/parse (e.g. its status endpoint 5xx-es)
-                    # must not abort discovery of the others.
-                    _LOGGER.error(f"Failed to add device {device_mac!r} ({device_title!r}): {e}")
+                    # must not abort discovery of the others; heartbeat() retries it later
+                    # (before, it stayed missing until the integration was reloaded).
+                    _LOGGER.error(f"Failed to add device {device_mac!r} ({device_title!r}), will retry: {e}")
+                    self._pending_devices.append({"spec": spec, "tries": 0, "next_at": 0.0})
                     continue
                 self.devices.append(device)
                 _LOGGER.info(f"Added device: {device}")
         if len(self.devices) > 0:
             self.connect_in_thread()
+
+    def register_platform(self, platform: str, async_add_entities: Callable) -> None:
+        # Kept so that a device loaded after setup (see retry_pending_devices) gets its entities.
+        self._platform_add_entities[platform] = async_add_entities
+
+    def retry_pending_devices(self) -> None:
+        now = time.monotonic()
+        for pending in list(self._pending_devices):
+            if now < pending["next_at"]:
+                continue
+            spec = pending["spec"]
+            try:
+                device = HaierDevice.create(haier=self, **spec)
+            except Exception as e:
+                # Every heartbeat at first, then less often (up to hourly): the device may be
+                # gone for good, and each failed attempt logs an error.
+                pending["tries"] += 1
+                pending["next_at"] = now + min(
+                    C.WS_HEARTBEAT_INTERVAL * 2 ** (pending["tries"] - 1),
+                    C.PENDING_DEVICE_RETRY_MAX,
+                )
+                _LOGGER.debug(f"Device {spec['device_mac']!r} still unavailable: {e}")
+                continue
+            self._pending_devices.remove(pending)
+            self.devices.append(device)
+            _LOGGER.info(f"Added device after retry: {device}")
+            self.hass.loop.call_soon_threadsafe(self._async_add_device_entities, device)
+
+    def _async_add_device_entities(self, device: HaierDevice) -> None:
+        # Runs in the event loop.
+        if self.disconnect_requested:
+            return
+        for platform, async_add_entities in self._platform_add_entities.items():
+            if entities := getattr(device, f"create_entities_{platform}")():
+                async_add_entities(entities)
 
     def refresh_devices(self, force: bool = False) -> None:
         # Re-fetch the current state of all devices with TTL protection, so that frequent
@@ -649,7 +697,8 @@ class Haier(object):
                 url=url,
                 on_message=self._on_message,
                 on_open=self._on_open,
-                on_ping=self._on_ping,
+                # No on_ping: websocket-client answers server pings itself (the old handler
+                # had the wrong signature and raised TypeError on every ping).
                 on_close=self._on_close,
             )
         else:
@@ -663,29 +712,26 @@ class Haier(object):
         message_device = str(message_dict.get("macAddress")).lower()
         device = self.get_device_by_id(message_device)
         if device is None:
+            if any(p["spec"]["device_mac"].lower() == message_device for p in self._pending_devices):
+                return  # failed to load at setup; heartbeat() retries it
             _LOGGER.error(f"Got a message for a device we don't know about: {message_device}")
         else:
             device.on_message(message_dict)
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_open(self, ws: WebSocket) -> None:
+        if self.disconnect_requested:
+            # stop() ran while this connection was being established — do not leave a session
+            # of an unloaded entry open (it would live on until the server drops it).
+            _LOGGER.debug("Websocket opened after stop, closing it")
+            ws.close()
+            return
         self.socket_status = SocketStatus.INITIALIZED
         self._connected_at = time.monotonic()
         _LOGGER.debug("Websocket opened")
         for device in self.devices:
             device.reset_session_state()
             device.init_if_needed()
-
-    # noinspection PyUnusedLocal
-    def _on_ping(self, ws: WebSocket) -> None:
-        # During reconnects socket_app.sock can be None — guard against AttributeError.
-        sock = getattr(self.socket_app, "sock", None)
-        if sock is None:
-            return
-        try:
-            sock.pong()
-        except Exception as e:
-            _LOGGER.debug(f"Failed to send pong: {e}")
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_close(self, ws: WebSocket, close_code: int, close_message: str) -> None:
@@ -804,6 +850,10 @@ class Haier(object):
         except Exception as e:
             _LOGGER.warning(f"heartbeat reconnect check failed: {e}")
         try:
+            self.retry_pending_devices()
+        except Exception as e:
+            _LOGGER.warning(f"heartbeat device retry failed: {e}")
+        try:
             self.refresh_devices(force=True)
         except Exception as e:
             _LOGGER.warning(f"heartbeat refresh failed: {e}")
@@ -811,6 +861,10 @@ class Haier(object):
     @connect_limits.sleep_and_retry
     @connect_limits
     def run_forever(self) -> None:
+        # stop() resets the limiters to wake sleeping threads, so this thread may come out of
+        # the reconnect wait AFTER stop(): it must not open a new session for an unloaded entry.
+        if self.disconnect_requested:
+            return
         _LOGGER.debug(f"Connecting to websocket ({C.API_WS_PATH})")
         try:
             self.socket_status = SocketStatus.INITIALIZING
@@ -1271,12 +1325,20 @@ class HaierDevice(object):
             _LOGGER.warning(f"Got unknown message: {message_dict}")
 
     def write_ha_state(self) -> None:
-        for callback in self._write_ha_state_callbacks:
+        # A copy: entities (un)subscribe from the event loop while this runs in worker threads.
+        for callback in list(self._write_ha_state_callbacks):
             self.hass.loop.call_soon_threadsafe(callback)
 
-    def add_write_ha_state_callback(self, callback) -> None:
+    def add_write_ha_state_callback(self, callback) -> Callable[[], None]:
+        # Returns the unsubscribe function, for Entity.async_on_remove().
         if callback not in self._write_ha_state_callbacks:
             self._write_ha_state_callbacks.append(callback)
+
+        def remove() -> None:
+            if callback in self._write_ha_state_callbacks:
+                self._write_ha_state_callbacks.remove(callback)
+
+        return remove
 
     # noinspection PyMethodMayBeStatic
     def create_entities_climate(self) -> list:

@@ -8,7 +8,7 @@
   "homekit": {},
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/and7ey/haier_evo/issues",
-  "requirements": ["websocket-client", "ratelimit"],
-  "version": "0.3.26-beta.14",
+  "requirements": ["websocket-client>=1.9.2", "ratelimit==2.2.1", "tenacity"],
+  "version": "0.3.26-beta.15",
   "zeroconf": []
 }

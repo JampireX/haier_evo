@@ -46,6 +46,9 @@ WS_SESSION_STALE_TIMEOUT = 30 * 60
 # stale/zombie WS session and re-pulls device state over REST, so a device the user only
 # observes (e.g. an idle washing machine) does not silently freeze on stale realtime data.
 WS_HEARTBEAT_INTERVAL = 5 * 60
+# A device whose REST config failed during setup is retried by the heartbeat: every tick at
+# first, then with a doubling interval capped at this many seconds.
+PENDING_DEVICE_RETRY_MAX = 60 * 60
 # On (re)connect the cloud pushes a full status snapshot on its own; if it has not arrived
 # within this many seconds after the first connect, the device state is refreshed over REST
 # instead. (Previously a target-temperature command was sent to force the snapshot — but any
