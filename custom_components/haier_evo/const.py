@@ -37,6 +37,12 @@ COMMAND_REJECT_REFRESH_DELAY = 2.0
 # is measured from the REAL send time (see _touch_sent), not from the CMD OUT log line which
 # precedes a possible multi-second reconnect.
 WS_CMD_CORRELATION_WINDOW = 45.0
+# The cloud answers every command with a command_response (same trace, errNo) within ~1s — the
+# Evo app's own traffic shows the same. No answer within this many seconds means the command was
+# lost (typically in a session the server no longer serves, e.g. opened with a since-revoked
+# token): the session is re-established and the command resent once. A session that has not
+# delivered anything yet (the cloud is still attaching it) gets one more period first.
+WS_CMD_ACK_TIMEOUT = 10.0
 # "Zombie" WS session guard: ping/pong keeps the TCP connection alive, but the server can
 # silently stop delivering application messages (observed: a 10.7h-old session with zero
 # inbound messages — the first command sent into it was lost). If nothing has been received
