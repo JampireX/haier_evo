@@ -109,6 +109,21 @@ class HaierWMRemainingTimeSensor(HaierSensor):
         self._attr_native_unit_of_measurement = "мин"
 
 
+class HaierWMPhaseSensor(HaierSensor):
+    _attr_icon = "mdi:progress-clock"
+
+    def __init__(self, device: api.HaierWM):
+        super().__init__(device)
+        self._device_attr_name = "phase_label"
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_phase"
+        self._attr_translation_key = "wm_phase"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        # The raw phase number, for automations: only some phases have a name.
+        return {"code": self._device.phase}
+
+
 class HaierWMStatusSensor(HaierSensor):
 
     def __init__(self, device: api.HaierWM):

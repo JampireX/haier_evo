@@ -1491,9 +1491,12 @@ class HaierAC(HaierDevice):
             self.light_on = parsebool(attr.get_item_name(value))
         elif attr.name == "sound":
             self.sound_on = parsebool(attr.get_item_name(value))
-        elif attr.name == "quiet":
+        elif attr.name in ("quiet", "preset_mode_sleep"):
+            # The API calls these "Тихий"/"Турбо" (-> preset_mode_sleep/boost); the quiet/turbo
+            # copies share the code and get_attr_by_code returns the first one, so both names
+            # must update the same state.
             self.quiet_on = parsebool(attr.get_item_name(value))
-        elif attr.name == "turbo":
+        elif attr.name in ("turbo", "preset_mode_boost"):
             self.turbo_on = parsebool(attr.get_item_name(value))
         elif attr.name == "health":
             self.health_on = parsebool(attr.get_item_name(value))
@@ -1718,6 +1721,11 @@ class HaierAC(HaierDevice):
         if commands := self.get_commands("preset_mode", value):
             self._send_commands(commands)
             self.preset_mode = value
+            # preset_mode is derived from quiet/turbo: update them too, so the new preset
+            # shows right away (the device confirms over WS).
+            if value in ("none", "sleep", "boost"):
+                self.quiet_on = value == "sleep"
+                self.turbo_on = value == "boost"
             self.write_ha_state()
 
     def set_light_on(self, value: bool) -> None:
@@ -2005,12 +2013,41 @@ class HaierWM(HaierDevice):
         self.remaining_hours = None
         self.remaining_minutes = None
         self.remote_control = None
+        self.phase = None
         self.programs: list[dict] = []
+        # Raw values of the attributes that identify the running program (see _update_program),
+        # the program title from REST (control.currentProgram) as a fallback, and the values
+        # the programs allow per attribute code (they extend the temperature/spin options).
+        self._program_codes: dict[str, str] = {}
+        self._rest_program = None
+        self._program_values: dict[str, set] = {}
+        # From the device's monitoringScreen: the cycle-phase attribute and its known labels.
+        self._phase_attr = None
+        self._phase_labels: dict[str, str] = {}
         self._get_status(backend_data)
 
     @property
     def config(self) -> CFG.HaierWMConfig:
         return self._config
+
+    @property
+    def phase_label(self) -> str | None:
+        if self.phase is None:
+            return None
+        if label := self._phase_labels.get(str(self.phase)):
+            return label
+        # Only a few phases are named by the device; 0 is reported while the machine is idle.
+        return "Ожидание" if self.phase == 0 else f"Этап {self.phase}"
+
+    @staticmethod
+    def _code(value) -> str:
+        # "10", "10.0" and 10 are the same code.
+        text = str(value).strip()
+        try:
+            number = float(text)
+        except ValueError:
+            return text
+        return str(int(number)) if number.is_integer() else text
 
     @property
     def remaining_time(self) -> float | None:
@@ -2033,6 +2070,8 @@ class HaierWM(HaierDevice):
             "remaining_minutes": self.remaining_minutes,
             "remaining_time": self.remaining_time,
             "remote_control": self.remote_control,
+            "phase": self.phase,
+            "phase_label": self.phase_label,
             "programs": [p["name"] for p in self.programs],
         })
         return data
@@ -2044,18 +2083,30 @@ class HaierWM(HaierDevice):
         for attr in attrs:
             self.config.attrs.append(attr)
         self.config.merge_attributes()
+        # Programs and the monitoring screen come from the full backend_data (allProgram /
+        # monitoringScreen sit next to smartDeviceControl). They are parsed before the values
+        # are applied: they extend the temperature/spin options and name the phase attribute.
+        self._parse_programs(self.status_data)
+        self._parse_monitoring(self.status_data)
+        self._extend_options_from_programs()
         for attr in self.config.attrs:
             self._set_attribute_value(str(attr.code), attr.current)
             _LOGGER.debug(f"{self.device_name}: {attr}")
-        # programs are parsed from the full backend_data: allProgram/control sit next to smartDeviceControl
-        self._parse_programs(self.status_data)
+        self._update_program()
 
     def _set_attribute_value(self, code: str, value: str) -> None:
         attr = self.config.get_attr_by_code(code)
         if not (attr and value is not None):
             return
+        code = str(code)
+        if code in C.WM_PROGRAM_ID_ATTRS:
+            self._program_codes[code] = self._code(value)
+            self._update_program()
+        elif code == self._phase_attr:
+            self.phase = parseint(value)
         elif attr.name == "status":
             self.status = attr.get_item_name(value)
+            self._update_program()
         elif attr.name == "program":
             self.program = attr.get_item_name(value)
         elif attr.name == "temperature":
@@ -2076,39 +2127,103 @@ class HaierWM(HaierDevice):
         business = sdc.get("businessAttributes") or data.get("businessAttributes") or []
         all_program = data.get("allProgram") or sdc.get("allProgram") or {}
         control = data.get("control") or sdc.get("control") or {}
-        # Program definitions: businessAttributes[].name (link) -> set of commands
-        definitions = {}
+        # Program definitions: businessAttributes[].name (link) -> set of commands, plus the
+        # codes that identify the program and every value each attribute may take.
+        definitions, values = {}, {}
         for ba in business:
             link = ba.get("name")
             params = ba.get("commandParameters") or {}
+            items = [a for a in (params.get("attrNameList") or []) if a.get("name") is not None]
             commands = [
                 {"commandName": str(a.get("name")), "value": str(a.get("defaultValue"))}
-                for a in (params.get("attrNameList") or [])
-                if a.get("name") is not None and a.get("defaultValue") is not None
+                for a in items if a.get("defaultValue") is not None
             ]
+            ids = {
+                str(a["name"]): self._code(a["defaultValue"])
+                for a in items
+                if str(a["name"]) in C.WM_PROGRAM_ID_ATTRS and a.get("defaultValue") is not None
+            }
+            for a in items:
+                bucket = values.setdefault(str(a["name"]), set())
+                if a.get("defaultValue") is not None:
+                    bucket.add(self._code(a["defaultValue"]))
+                options = ((a.get("valueRange") or {}).get("list") or {}).get("data") or []
+                bucket.update(self._code(o["data"]) for o in options if o.get("data") is not None)
             if link and commands:
-                definitions[link] = commands
+                definitions[link] = (commands, ids)
+        self._program_values = values
         # UI catalog: allProgram.blocks[].programs[] -> Russian names and links
         programs, seen = [], set()
         for block in all_program.get("blocks", []) or []:
             for prog in block.get("programs", []) or []:
                 link = ((prog.get("programConfig") or {}).get("link") or {}).get("name")
                 name = (prog.get("preview") or {}).get("name")
-                commands = definitions.get(link)
-                if not (name and commands) or name in seen:
+                if not (name and link in definitions) or name in seen:
                     continue
                 seen.add(name)
+                commands, ids = definitions[link]
                 programs.append({
                     "name": name,
                     "link": link,
                     "template_id": prog.get("templateId"),
                     "commands": commands,
+                    "ids": ids,
                 })
         self.programs = programs
-        # Current program, if the device reports it
-        current = (control.get("currentProgram") or {}).get("title")
-        if current:
-            self.program = current
+        # Program title from REST, if the device reports one (used when the codes do not match)
+        self._rest_program = (control.get("currentProgram") or {}).get("title") or None
+
+    def _parse_monitoring(self, data: dict) -> None:
+        # monitoringScreen names the cycle-phase attribute and labels a few of its values
+        # (weighing, finishing, fresh air); the other phases are shown by number.
+        screen = (data or {}).get("monitoringScreen") or {}
+        phase = (screen.get("phase") or {}).get("name")
+        self._phase_attr = str(phase) if phase not in (None, "") else None
+        labels = {}
+        for block, key in (
+            ("weighing", "weightAttrValue"),
+            ("finishing", "finishingAttrValue"),
+            ("freshAirSystem", "freshAirSystemAttrValue"),
+        ):
+            part = screen.get(block) or {}
+            if part.get(key) not in (None, "") and part.get("title"):
+                labels[self._code(part[key])] = part["title"]
+        self._phase_labels = labels
+
+    def _extend_options_from_programs(self) -> None:
+        # The programs list the temperatures / spin speeds the machine accepts. Add the ones the
+        # YAML mappings lack (e.g. 1200 rpm), labelled with their value — in code, because a
+        # user copy of the YAML in <config> overrides the packaged one.
+        for name in ("temperature", "spin_speed"):
+            attr = self.config.get_attr_by_name(name)
+            allowed = self._program_values.get(str(attr.code)) if attr is not None else None
+            if not allowed:
+                continue
+            data = list((attr.get("list") or {}).get("data") or [])
+            known = {self._code(i.get("data")) for i in data}
+            missing = [v for v in allowed if v not in known]
+            if not missing:
+                continue
+            data += [{"data": v, "name": v, "attrname": v} for v in missing]
+            attr.list = sorted(data, key=lambda i: _numeric_key(i.get("data")))
+
+    def _update_program(self) -> None:
+        # The machine reports the running program as codes (WM_PROGRAM_ID_ATTRS), mapped back
+        # here through the program definitions to the name shown in the app.
+        if not any(p["ids"] for p in self.programs):
+            return  # nothing to match against: keep the REST title / last selected program
+        if self.status == "off":
+            self.program = None
+            return
+        for code in C.WM_PROGRAM_ID_ATTRS:
+            current = self._program_codes.get(code)
+            if current in (None, ""):
+                continue
+            matches = [p for p in self.programs if p["ids"].get(code) == current]
+            if len(matches) == 1:
+                self.program = matches[0]["name"]
+                return
+        self.program = self._rest_program
 
     def _ensure_remote_control(self) -> None:
         # When remote control is disabled the machine (like the native app) only allows
@@ -2138,6 +2253,9 @@ class HaierWM(HaierDevice):
             if program["commands"]:
                 self._send_commands(program["commands"])
                 self.program = value
+                # Keep the codes in step, so a status update that arrives before the device
+                # echoes the new program does not switch the select back (_update_program).
+                self._program_codes.update(program["ids"])
                 self.write_ha_state()
             return
         # fallback: a single attribute from YAML
@@ -2178,6 +2296,8 @@ class HaierWM(HaierDevice):
             entities.append(sensor.HaierWMRemainingTimeSensor(self))
         if self.config['status'] is not None:
             entities.append(sensor.HaierWMStatusSensor(self))
+        if self._phase_attr is not None:
+            entities.append(sensor.HaierWMPhaseSensor(self))
         return entities
 
     def create_entities_binary_sensor(self) -> list:
@@ -2192,6 +2312,14 @@ def parsebool(value) -> bool:
     if value in ("on", 1, True, "true", "enable", "1"):
         return True
     return False
+
+
+def _numeric_key(value) -> tuple:
+    # Sort numbers numerically, anything else after them.
+    try:
+        return 0, float(value), ""
+    except (TypeError, ValueError):
+        return 1, 0.0, str(value)
 
 
 def parseint(value) -> int | None:
