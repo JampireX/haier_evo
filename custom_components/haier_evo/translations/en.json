@@ -1,11 +1,13 @@
 {
     "config": {
         "abort": {
-            "already_configured": "already configured"
+            "already_configured": "already configured",
+            "reauth_successful": "Password updated, the integration has been reloaded"
         },
         "error": {
             "cannot_connect": "cannot connect",
             "invalid_auth": "invalid_auth",
+            "invalid_password": "Invalid password",
             "unknown": "unknown"
         },
         "step": {
@@ -21,6 +23,13 @@
                     "password": "Password",
                     "email": "Login (email)",
                     "region": "Region"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Re-authentication required",
+                "description": "The Haier Evo server rejected the password for {email}. Enter the current password.",
+                "data": {
+                    "password": "Password"
                 }
             }
         }

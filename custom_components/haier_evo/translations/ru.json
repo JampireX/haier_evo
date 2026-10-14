@@ -1,11 +1,13 @@
 {
     "config": {
         "abort": {
-            "already_configured": "already configured"
+            "already_configured": "already configured",
+            "reauth_successful": "Пароль обновлён, интеграция перезапущена"
         },
         "error": {
             "cannot_connect": "cannot connect",
             "invalid_auth": "invalid_auth",
+            "invalid_password": "Некорректный пароль",
             "unknown": "unknown"
         },
         "step": {
@@ -21,6 +23,13 @@
                     "password": "Пароль",
                     "email": "Логин (email)",
                     "region": "Регион"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Требуется повторный вход",
+                "description": "Сервер Haier Evo не принял пароль для {email}. Введите актуальный пароль.",
+                "data": {
+                    "password": "Пароль"
                 }
             }
         }

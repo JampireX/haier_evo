@@ -49,7 +49,9 @@ So **adding support for a new feature or device usually means editing these tabl
 - **Commands out**: HA entity method → `device.set_*` → `get_commands` (resolves attr code + value code, applies `Constraint`) → `_send_commands` → `_send_group_command` (if the config has a `command_name`) or `_send_single_command` → WS `send`. Device state is also optimistically updated locally.
 
 ### Auth & rate limiting
-- Tokens (access + refresh, with expiry) are persisted to `<hass_config>/haier_evo` (a JSON file named after `DOMAIN`). `auth()` refreshes or re-logs-in based on expiry; timezone is hardcoded to UTC+3.
+- Tokens (access + refresh, with expiry) are persisted per config entry to `<hass_config>/haier_evo_tokens_<entry_id>.json`, bound to the entry's email + region (ignored after a credentials change, deleted in `async_remove_entry`; the legacy shared `<hass_config>/haier_evo` file is removed on setup). `auth()` refreshes or re-logs-in based on the *local* expiry; timezone is hardcoded to UTC+3.
+- The server can reject a token before its local expiry: REST answers `401`, the WS gateway accepts the upgrade (`101`) and then closes with `1007 "Auth token not valid!"`. Both call `invalidate_token()`, which expires it locally so the next `auth()` refreshes it (not for a token younger than `TOKEN_REJECT_MIN_AGE`, to avoid a refresh loop).
+- Setup errors: rejected email/password → `ConfigEntryAuthFailed` (reauth flow; also triggered at runtime via `on_auth_failed`), network / 429 / 5xx → `ConfigEntryNotReady` (HA retries; after a 429 an extra per-entry backoff `_SETUP_BACKOFF` keeps retries off the cloud).
 - `ResettableLimits` (in `limits.py`) wraps each network operation. On `429`/`5xx` the period is extended (`add_period`) and backed off; on success it's reset. Login and refresh limiters reset each other so the two paths don't starve.
 
 ### Debug HTTP endpoint

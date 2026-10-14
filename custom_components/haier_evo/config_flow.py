@@ -51,6 +51,30 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors
         )
 
+    async def async_step_reauth(self, entry_data):
+        # Started by HA when setup raised ConfigEntryAuthFailed, or by the integration when
+        # the server rejected the stored password at runtime.
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        errors = {}
+        entry = self._get_reauth_entry()
+        if user_input is not None:
+            try:
+                await validate_input(self.hass, {**entry.data, **user_input})
+                return self.async_update_reload_and_abort(entry, data_updates=user_input)
+            except InvalidPassword:
+                errors["password"] = "invalid_password"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required("password"): str}),
+            description_placeholders={"email": entry.data.get("email", "")},
+            errors=errors
+        )
+
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
@@ -69,6 +93,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     title=info["title"],
                     data={**self.config_entry.data, **user_input},
                 )
+                # Apply the new credentials right away (there is no update listener).
+                self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
                 return self.async_create_entry(title="", data={})
             except InvalidEmail:
                 errors["email"] = "invalid_email"
