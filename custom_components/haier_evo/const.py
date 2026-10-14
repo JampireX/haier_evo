@@ -54,6 +54,13 @@ WS_INIT_SNAPSHOT_TIMEOUT = 10.0
 # A status message carrying at least this many properties is treated as a full snapshot
 # (incremental updates carry 1-2 properties, full snapshots ~30).
 WS_FULL_SNAPSHOT_MIN_PROPS = 10
+# The WS gateway rejects an invalid/revoked access token by accepting the upgrade (101) and then
+# closing with this code ("Auth token not valid!"). REST endpoints answer 401 instead.
+WS_CLOSE_AUTH_FAILED = 1007
+# A token the server rejects is expired locally to force a refresh (see Haier.invalidate_token),
+# unless it was obtained less than this many seconds ago: a server that rejects even fresh tokens
+# must not drive a tight refresh loop (at most one forced refresh per this interval).
+TOKEN_REJECT_MIN_AGE = 60
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5

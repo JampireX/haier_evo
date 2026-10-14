@@ -1,6 +1,7 @@
 from __future__ import annotations
 import requests
 import json
+import os
 import time
 import threading
 import uuid
@@ -27,6 +28,9 @@ from . import const as C # noqa
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate we cannot connect."""
+
+class InvalidCredentials(InvalidAuth):
+    """Error to indicate the server rejected the email/password."""
 
 class InvalidDevicesList(HomeAssistantError):
     """Error to indicate we cannot connect."""
@@ -184,7 +188,8 @@ class Haier(object):
         email: str,
         password: str,
         region: str,
-        http: bool = C.API_HTTP_ROUTE
+        http: bool = C.API_HTTP_ROUTE,
+        entry_id: str = "default",
     ) -> None:
         self._lock = threading.Lock()
         # Serializes WebSocket writes: HA executor threads and the WS thread (_on_open ->
@@ -204,6 +209,16 @@ class Haier(object):
         self.tokenexpire: datetime | None = None
         self.refreshtoken: str | None = None
         self.refreshexpire: datetime | None = None
+        # Tokens are stored per config entry: a single shared file let one entry pick up
+        # another account's (or a stale) token.
+        self._tokens_file = self.tokens_file(hass, entry_id)
+        # Monotonic time the current access token was obtained in this process (None for a
+        # token loaded from disk) — see invalidate_token.
+        self._token_obtained_at = None
+        # Access token the current WS session was opened with (it is part of the WS URL).
+        self._ws_token = None
+        # Called from a worker thread when the server rejects the email/password at runtime.
+        self.on_auth_failed = None
         self.socket_app: WebSocketApp | None = None
         self.disconnect_requested = False
         self.socket_status: SocketStatus = SocketStatus.PRE_INITIALIZATION
@@ -222,12 +237,46 @@ class Haier(object):
             "devices": [device.to_dict() for device in self.devices]
         }
 
+    @staticmethod
+    def tokens_file(hass: HomeAssistant, entry_id: str) -> str:
+        return hass.config.path(f"{C.DOMAIN}_tokens_{entry_id}.json")
+
+    @classmethod
+    def remove_tokens_file(cls, hass: HomeAssistant, entry_id: str) -> None:
+        try:
+            os.remove(cls.tokens_file(hass, entry_id))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            _LOGGER.warning(f"Failed to remove tokens file: {e}")
+
+    def _remove_legacy_tokens_file(self) -> None:
+        # Tokens used to live in a single <config>/haier_evo file shared by all entries. It is
+        # no longer read, so drop it rather than leave a stale refresh token on disk.
+        # (<config>/haier_evo.<model>.yaml device configs only share the prefix — untouched.)
+        legacy = self.hass.config.path(C.DOMAIN)
+        if os.path.isfile(legacy):
+            try:
+                os.remove(legacy)
+                _LOGGER.info(f"Removed legacy shared tokens file: {legacy}")
+            except OSError as e:
+                _LOGGER.warning(f"Failed to remove legacy tokens file {legacy}: {e}")
+
     def load_tokens(self) -> None:
-        filename = self.hass.config.path(C.DOMAIN)
+        self._remove_legacy_tokens_file()
+        filename = self._tokens_file
         try:
             with open(filename, "r") as f:
                 data = json.load(f)
             assert isinstance(data, dict), "Bad saved tokens file"
+            # Tokens are bound to the account and region they were issued for, so they are
+            # not reused after the credentials were changed in the options.
+            if (
+                str(data.get("email") or "").lower() != self.email.lower()
+                or data.get("region") != self.region
+            ):
+                _LOGGER.info(f"Saved tokens belong to another account/region, ignoring: {filename}")
+                return
             self.token = data.get("token", None)
             tokenexpire = data.get("tokenexpire")
             self.tokenexpire = datetime.fromisoformat(tokenexpire) if tokenexpire else None
@@ -242,9 +291,11 @@ class Haier(object):
 
     def save_tokens(self) -> None:
         try:
-            filename = self.hass.config.path(C.DOMAIN)
+            filename = self._tokens_file
             with open(filename, "w") as f:
                 json.dump({
+                    "email": self.email,
+                    "region": self.region,
                     "token": self.token,
                     "tokenexpire": str(self.tokenexpire) if self.tokenexpire else None,
                     "refreshtoken": self.refreshtoken,
@@ -399,9 +450,17 @@ class Haier(object):
             self.tokenexpire = resp.access_expire
             self.refreshtoken = resp.refresh_token
             self.refreshexpire = resp.refresh_expire
+            self._token_obtained_at = time.monotonic()
             self.save_tokens()
         except AuthValidationError as e:
             raise e
+        except AuthUserError as e:
+            # The server rejected the email/password ("Введен неверный email или пароль") —
+            # retrying cannot help, the user has to re-enter the credentials.
+            _LOGGER.error(f"Login rejected by the server: {e}")
+            if self.on_auth_failed is not None:
+                self.on_auth_failed()
+            raise InvalidCredentials(str(e)) from e
         except AssertionError as e:
             # A 5xx error body has no token, so resp.access_token/… assert here. login() is
             # only called with an expired/absent token, so there is nothing valid to fall back
@@ -434,52 +493,69 @@ class Haier(object):
             # _LOGGER.debug(f"Token expired or empty")
             return self.login()
 
-    def pull_data_from_api(self) -> dict:
-        self.auth()
-        response = None
-        try:
-            devices_path = urljoin(C.API_PATH, C.API_DEVICES.format(region=self.region))
-            _LOGGER.debug(f"Getting devices, url: {devices_path}")
-            response = requests.get(devices_path, headers={
-                'X-Auth-Token': self.token,
-                'User-Agent': 'evo-mobile',
-                'Platform': 'android',
-                'Device-Id': self._device_id,
-                'Content-Type': 'application/json'
-            }, timeout=C.API_TIMEOUT)
-            # _LOGGER.debug(response.text)
-            response.raise_for_status()
-            data = response.json().get("data", {})
-            assert isinstance(data, dict), f"Data is not dict: {data}"
-            return data
-        except Exception as e:
-            _LOGGER.error(f"Failed to get devices {e}, response was: {response}")
-            return {}
+    def invalidate_token(self, rejected: str | None, reason: str) -> None:
+        # The server rejected an access token that is still valid by the LOCAL expiry clock
+        # (revoked server-side, clock skew, stale token file). auth() only compares that clock,
+        # so without this the dead token was reused until its local expiry: the WS reconnected
+        # with it every few seconds, REST failed with 401 and every command was lost. Expire it
+        # locally so the next auth() refreshes it (or logs in again if the refresh token is
+        # dead too).
+        with self._lock:
+            if not rejected or rejected != self.token or self.tokenexpire is None:
+                return  # already replaced or invalidated by another thread
+            obtained = self._token_obtained_at
+            if obtained is not None and time.monotonic() - obtained < C.TOKEN_REJECT_MIN_AGE:
+                # Even a just-issued token is rejected — refreshing again right away would
+                # only spin the auth endpoints; let it age first.
+                _LOGGER.debug(f"Fresh access token rejected ({reason}), not refreshing yet")
+                return
+            _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
+            self.tokenexpire = None
+            self.save_tokens()
 
-    @retry(
-        retry=retry_if_exception_type(HTTPError),
-        stop=stop_after_attempt(2),
-    )
-    def pull_device_data(self, device_mac: str) -> dict:
-        self.auth()
-        response = None
-        try:
-            status_url = C.API_STATUS.format(mac=device_mac)
-            _LOGGER.debug(f"Getting initial status of device {device_mac}, url: {status_url}")
-            response = requests.get(status_url, headers={
-                'X-Auth-Token': self.token,
+    def _authorized_get(self, url: str) -> requests.Response:
+        # A 401 means the token is no longer accepted although it has not expired locally:
+        # invalidate it and retry once with a refreshed one. A 5xx is also retried once.
+        for attempt in (1, 2):
+            self.auth()
+            token = self.token
+            response = requests.get(url, headers={
+                'X-Auth-Token': token,
                 'User-Agent': 'evo-mobile',
                 'Platform': 'android',
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
             }, timeout=C.API_TIMEOUT)
-            # _LOGGER.debug(f"Update device {device_mac} status code: {response.status_code}")
-            # _LOGGER.debug(response.text)s
+            if attempt == 1 and response.status_code == 401:
+                self.invalidate_token(token, f"HTTP 401 from {urlparse(url).path}")
+                continue
+            if attempt == 1 and response.status_code >= 500:
+                _LOGGER.warning(f"HTTP {response.status_code} from {urlparse(url).path}, retrying")
+                continue
             response.raise_for_status()
-            data = response.json()
-            return data
+            return response
+
+    def pull_data_from_api(self) -> dict:
+        # Errors propagate on purpose: async_setup_entry turns them into ConfigEntryNotReady,
+        # so HA retries the setup instead of leaving the entry in a permanent setup error.
+        devices_path = urljoin(C.API_PATH, C.API_DEVICES.format(region=self.region))
+        _LOGGER.debug(f"Getting devices, url: {devices_path}")
+        try:
+            data = self._authorized_get(devices_path).json().get("data", {})
         except Exception as e:
-            _LOGGER.error(f"Failed to get status: {e}, response was: {response}")
+            _LOGGER.error(f"Failed to get devices: {e!r}")
+            raise
+        if not isinstance(data, dict):
+            raise InvalidDevicesList(f"Data is not dict: {data}")
+        return data
+
+    def pull_device_data(self, device_mac: str) -> dict:
+        status_url = C.API_STATUS.format(mac=device_mac)
+        _LOGGER.debug(f"Getting initial status of device {device_mac}, url: {status_url}")
+        try:
+            return self._authorized_get(status_url).json()
+        except Exception as e:
+            _LOGGER.error(f"Failed to get status: {e!r}")
             raise
 
     def pull_data(self) -> None:
@@ -566,6 +642,7 @@ class Haier(object):
 
     def _init_ws(self) -> None:
         self.auth()
+        self._ws_token = self.token
         url = urljoin(C.API_WS_PATH, self.token)
         if self.socket_app is None:
             self.socket_app = WebSocketApp(
@@ -616,6 +693,10 @@ class Haier(object):
         # treat a connection that is being re-established as still INITIALIZED.
         self.socket_status = SocketStatus.NOT_INITIALIZED
         _LOGGER.debug(f"Websocket closed. Code: {close_code}, message: {close_message}")
+        # A dead token is rejected AFTER the 101 upgrade: the gateway closes with 1007
+        # "Auth token not valid!" — expire it, so the reconnect does not reuse it.
+        if close_code == C.WS_CLOSE_AUTH_FAILED or "token" in str(close_message or "").lower():
+            self.invalidate_token(self._ws_token, f"WS closed: {close_code} {close_message!r}")
 
     def _wait_websocket(self, timeout: float) -> None:
         current = time.time()
