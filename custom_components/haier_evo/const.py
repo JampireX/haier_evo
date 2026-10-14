@@ -64,6 +64,10 @@ WS_CLOSE_AUTH_FAILED = 1007
 # unless it was obtained less than this many seconds ago: a server that rejects even fresh tokens
 # must not drive a tight refresh loop (at most one forced refresh per this interval).
 TOKEN_REJECT_MIN_AGE = 60
+# Washing machines report the running program as codes: attribute 90 tells apart the "evo"
+# programs (they all share 0 == 45), attribute 0 the others. They are matched against the
+# program definitions (businessAttributes), the more specific attribute first.
+WM_PROGRAM_ID_ATTRS = ("90", "0")
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5

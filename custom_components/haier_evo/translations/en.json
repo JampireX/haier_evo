@@ -130,6 +130,9 @@
             },
             "wm_status": {
                 "name": "Status"
+            },
+            "wm_phase": {
+                "name": "Phase"
             }
         },
         "binary_sensor": {

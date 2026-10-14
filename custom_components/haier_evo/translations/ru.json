@@ -130,6 +130,9 @@
             },
             "wm_status": {
                 "name": "Статус"
+            },
+            "wm_phase": {
+                "name": "Этап"
             }
         },
         "binary_sensor": {
