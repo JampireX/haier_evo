@@ -150,18 +150,18 @@ class AuthResponse(object):
 
 
 def _log_send_message_failure(retry_state):
-    # Called by tenacity once send_message has exhausted every attempt: at this point the
-    # command is lost. We always log it as an error (and dump the payload + last exception)
-    # so a dropped command — in particular the first one after an idle period — is never
-    # silently swallowed.
+    # Called by tenacity once send_message has exhausted every attempt (the device's ACK
+    # watchdog still resends the command once, see HaierDevice._on_ack_timeout). We always log
+    # it as an error (and dump the payload + last exception) so a dropped command — in
+    # particular the first one after an idle period — is never silently swallowed.
     payload = retry_state.args[1] if len(retry_state.args) > 1 else "<unknown>"
     outcome = retry_state.outcome
     exc = outcome.exception() if outcome is not None else None
     _LOGGER.error(
-        f"Command NOT sent (lost) after {retry_state.attempt_number} attempt(s). "
+        f"Command NOT sent after {retry_state.attempt_number} attempt(s). "
         f"Last error: {exc!r}. Payload: {payload}"
     )
-    return None
+    return False
 
 
 class Haier(object):
@@ -218,6 +218,8 @@ class Haier(object):
         self._token_obtained_at = None
         # Access token the current WS session was opened with (it is part of the WS URL).
         self._ws_token = None
+        # Serializes restart_session(): commands timing out together restart the session once.
+        self._restart_lock = threading.Lock()
         # Called from a worker thread when the server rejects the email/password at runtime.
         self.on_auth_failed = None
         # Devices whose REST config failed during setup: heartbeat() retries them and adds
@@ -504,25 +506,26 @@ class Haier(object):
             # _LOGGER.debug(f"Token expired or empty")
             return self.login()
 
-    def invalidate_token(self, rejected: str | None, reason: str) -> None:
+    def invalidate_token(self, rejected: str | None, reason: str) -> bool:
         # The server rejected an access token that is still valid by the LOCAL expiry clock
         # (revoked server-side, clock skew, stale token file). auth() only compares that clock,
         # so without this the dead token was reused until its local expiry: the WS reconnected
         # with it every few seconds, REST failed with 401 and every command was lost. Expire it
         # locally so the next auth() refreshes it (or logs in again if the refresh token is
-        # dead too).
+        # dead too). Returns True when the token was expired here.
         with self._lock:
             if not rejected or rejected != self.token or self.tokenexpire is None:
-                return  # already replaced or invalidated by another thread
+                return False  # already replaced or invalidated by another thread
             obtained = self._token_obtained_at
             if obtained is not None and time.monotonic() - obtained < C.TOKEN_REJECT_MIN_AGE:
                 # Even a just-issued token is rejected — refreshing again right away would
                 # only spin the auth endpoints; let it age first.
                 _LOGGER.debug(f"Fresh access token rejected ({reason}), not refreshing yet")
-                return
+                return False
             _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
             self.tokenexpire = None
             self.save_tokens()
+            return True
 
     def _authorized_get(self, url: str) -> requests.Response:
         # A 401 means the token is no longer accepted although it has not expired locally:
@@ -538,7 +541,11 @@ class Haier(object):
                 'Content-Type': 'application/json'
             }, timeout=C.API_TIMEOUT)
             if attempt == 1 and response.status_code == 401:
-                self.invalidate_token(token, f"HTTP 401 from {urlparse(url).path}")
+                if self.invalidate_token(token, f"HTTP 401 from {urlparse(url).path}") and token == self._ws_token:
+                    # The websocket was opened with this very token. Its session may stay open
+                    # without being served any more (commands sent into it go unanswered) —
+                    # reopen it now; the reconnect picks up the refreshed token.
+                    self.restart_session(self._connected_at, "its access token was rejected (HTTP 401)")
                 continue
             if attempt == 1 and response.status_code >= 500:
                 _LOGGER.warning(f"HTTP {response.status_code} from {urlparse(url).path}, retrying")
@@ -800,6 +807,18 @@ class Haier(object):
         while self._is_socket_ready() and time.monotonic() < deadline:
             time.sleep(0.05)
 
+    def restart_session(self, session: float | None, reason: str) -> bool:
+        # Re-establishes the WS session the caller saw (session = its _connected_at). Several
+        # callers may detect the same dead session at once (e.g. two unanswered commands):
+        # only the first one restarts it, a session that is already down or newer is left
+        # alone. Must not run in the WS thread (_force_reconnect waits for that thread).
+        with self._restart_lock:
+            if self.disconnect_requested or session != self._connected_at or not self._is_socket_ready():
+                return False
+            _LOGGER.warning(f"Re-establishing the websocket session: {reason}")
+            self._force_reconnect()
+            return True
+
     def connect_if_needed(self, timeout: float = 4.0) -> None:
         if self.socket_thread and self.socket_thread.is_alive():
             _LOGGER.info(
@@ -884,7 +903,7 @@ class Haier(object):
         retry_error_callback=_log_send_message_failure,
         wait=wait_fixed(1.0),
     )
-    def send_message(self, payload: str) -> None:
+    def send_message(self, payload: str) -> bool:
         # A long-idle socket may be down or half-open: a send() into it can either raise or —
         # worse — return successfully and then the socket closes a few ms later, silently
         # losing the command (no exception, so the retry never fires). To avoid that we:
@@ -893,6 +912,7 @@ class Haier(object):
         #   3) re-check right after sending and, if the socket just closed, raise -> retry
         #      (which reconnects and resends; all our commands carry absolute values, so a
         #       duplicate resend is harmless).
+        # Returns True once the payload is on the wire, False when every attempt failed.
         with self._send_lock:
             if not self._is_socket_ready():
                 _LOGGER.warning(
@@ -929,6 +949,7 @@ class Haier(object):
                 )
                 self.connect_if_needed()
                 raise ConnectionError("Socket closed right after send")
+            return True
 
 
 class HaierDevice(object):
@@ -966,6 +987,9 @@ class HaierDevice(object):
         # True once a full status snapshot (all attributes at once) has been received
         # over WS — see init_if_needed/_init_snapshot_fallback.
         self._snapshot_seen = False
+        # Commands sent but not answered (command_response) yet: trace -> what was sent and
+        # where. Guarded by _sent_lock; see _on_ack_timeout.
+        self._awaiting_ack: dict[str, dict] = {}
 
     def __repr__(self) -> str:
         return (
@@ -1001,9 +1025,18 @@ class HaierDevice(object):
     @available.setter
     def available(self, value: bool | str):
         if not isinstance(value, bool):
-            self._available = False if str(value).upper() == 'OFFLINE' else True
-        else:
-            self._available = value
+            value = str(value).upper() != 'OFFLINE'
+        # The entities stay available either way (see above), so say it in the log: a device
+        # the cloud has lost cannot receive commands.
+        if value != self._available:
+            if value:
+                _LOGGER.info(f"{self.device_name}: online in the Haier cloud again")
+            else:
+                _LOGGER.warning(
+                    f"{self.device_name}: the Haier cloud reports the device OFFLINE — "
+                    f"commands cannot reach it until it reconnects"
+                )
+        self._available = value
 
     @property
     def status_data(self) -> dict:
@@ -1065,21 +1098,23 @@ class HaierDevice(object):
             self._get_status(data)
         self.write_ha_state()
 
-    def _schedule_refresh_after_rejection(self) -> None:
-        # Called from the WS thread; refresh() is a blocking REST call (API_TIMEOUT=15s)
-        # and must not run here — it would stall ping/pong and message dispatch.
+    def _schedule_refresh_after_failure(self) -> None:
+        # A command was rejected or lost, but set_* already applied its value optimistically:
+        # re-pull the real state. Called from the WS / timer threads; refresh() is a blocking
+        # REST call (API_TIMEOUT=15s) and must not run in the WS thread — it would stall
+        # ping/pong and message dispatch.
         if self._reject_refresh_pending:
             return
         self._reject_refresh_pending = True
-        threading.Thread(target=self._refresh_after_rejection, daemon=True).start()
+        threading.Thread(target=self._refresh_after_failure, daemon=True).start()
 
-    def _refresh_after_rejection(self) -> None:
+    def _refresh_after_failure(self) -> None:
         try:
             time.sleep(C.COMMAND_REJECT_REFRESH_DELAY)
             self.refresh()
         except Exception as e:
             _LOGGER.warning(
-                f"Failed to refresh {self.device_name} after command rejection: {e}"
+                f"Failed to refresh {self.device_name} after a failed command: {e}"
             )
         finally:
             self._reject_refresh_pending = False
@@ -1117,17 +1152,18 @@ class HaierDevice(object):
         payload = received_message.get("payload", {})
         self.sw_version = payload.get("swVersion") or self.sw_version
 
-    def _send_message(self, message: dict) -> None:
-        self._haier.send_message(json.dumps(message))
+    def _send_message(self, message: dict) -> bool:
+        return self._haier.send_message(json.dumps(message)) is not False
 
     def _send_commands(self, commands: list[dict]) -> None:
         self._send_group_command(commands)
 
-    def _send_group_command(self, commands: list[dict]) -> None:
+    def _send_group_command(self, commands: list[dict], attempt: int = 1) -> None:
         if self.config.command_name:
             trace = str(uuid.uuid4())
-            self._record_sent(commands, trace)
-            self._send_message({
+            self._record_sent(commands, trace, attempt)
+            self._expect_ack(trace, commands, single=False, attempt=attempt)
+            sent = self._send_message({
                 "action": "operation",
                 "macAddress": self.device_id,
                 "commandName": self.config.command_name,
@@ -1135,20 +1171,124 @@ class HaierDevice(object):
                 "trace": trace,
             })
             self._touch_sent(trace)
+            self._watch_ack(trace, sent)
         else:
             for c in commands:
-                self._send_single_command(c)
+                self._send_single_command(c, attempt)
 
-    def _send_single_command(self, command: dict) -> None:
+    def _send_single_command(self, command: dict, attempt: int = 1) -> None:
         trace = str(uuid.uuid4())
-        self._record_sent([command], trace)
-        self._send_message({
+        self._record_sent([command], trace, attempt)
+        self._expect_ack(trace, [command], single=True, attempt=attempt)
+        sent = self._send_message({
             "action": "command",
             "macAddress": self.device_id,
             "command": command,
             "trace": trace,
         })
         self._touch_sent(trace)
+        self._watch_ack(trace, sent)
+
+    # --- ACK watchdog ---------------------------------------------------------
+    # The cloud answers each command with a command_response carrying its trace. A command
+    # sent into a session the server no longer serves (zombie session, revoked token) gets no
+    # answer and used to vanish silently: HA showed the optimistic state, the device did
+    # nothing. Now the session is re-established and the command resent once; if that is not
+    # answered either, the loss is logged and the real state is pulled back.
+    def _expect_ack(self, trace: str, commands: list[dict], single: bool, attempt: int) -> None:
+        # Registered before sending: the answer can arrive before _send_message returns.
+        with self._sent_lock:
+            self._awaiting_ack[trace] = {
+                "commands": commands, "single": single, "attempt": attempt,
+                "session": None, "sent": False, "extended": False,
+            }
+
+    def _watch_ack(self, trace: str, sent: bool) -> None:
+        # The timeout starts once the command is on the wire (sending may have included a
+        # reconnect); "session" records which WS session it went into.
+        with self._sent_lock:
+            entry = self._awaiting_ack.get(trace)
+            if entry is None:
+                return  # already answered
+            entry["session"] = self._haier._connected_at
+            entry["sent"] = sent
+        self._start_ack_timer(trace)
+
+    def _start_ack_timer(self, trace: str) -> None:
+        timer = threading.Timer(C.WS_CMD_ACK_TIMEOUT, self._on_ack_timeout, args=(trace,))
+        timer.daemon = True
+        timer.start()
+
+    def _on_ack_timeout(self, trace: str) -> None:
+        # Runs in a timer thread.
+        try:
+            haier = self._haier
+            if haier.disconnect_requested:
+                return
+            current_session = haier._connected_at
+        except ReferenceError:
+            return  # the config entry was unloaded
+        with self._sent_lock:
+            entry = self._awaiting_ack.get(trace)
+            if entry is None:
+                return  # answered in the meantime
+            # Values the device has reported meanwhile (confirmed) or that a newer command
+            # replaced are not resent.
+            pending = [
+                c for c in entry["commands"]
+                if (self._sent_commands.get(str(c.get("commandName"))) or {}).get("trace") == trace
+            ]
+            # A session the cloud has not attached yet (nothing received since it opened)
+            # answers late — observed ~15s after a reconnect: give it one more period.
+            wait_more = bool(
+                pending
+                and entry["sent"]
+                and not entry["extended"]
+                and self._session_ready_at is None
+                and entry["session"] == current_session
+            )
+            if wait_more:
+                entry["extended"] = True
+            else:
+                self._awaiting_ack.pop(trace, None)
+        cmds = self._summarize(entry["commands"])
+        if not pending:
+            _LOGGER.info(
+                f"CMD NO ACK [{self.device_name}] trace={trace} cmds={cmds}, but the device "
+                f"already reports these values (or newer commands replaced them) — not resending"
+            )
+            return
+        if wait_more:
+            _LOGGER.info(
+                f"CMD ACK pending [{self.device_name}] trace={trace}: the session has not "
+                f"delivered anything yet, waiting another {C.WS_CMD_ACK_TIMEOUT:.0f}s"
+            )
+            self._start_ack_timer(trace)
+            return
+        if entry["sent"]:
+            problem = f"no answer from the cloud within {C.WS_CMD_ACK_TIMEOUT:.0f}s"
+        else:
+            problem = "it could not be sent"
+        offline = "" if self._available else "the cloud reports the device OFFLINE"
+        if entry["attempt"] == 1:
+            _LOGGER.warning(
+                f"CMD NO ACK [{self.device_name}] trace={trace} cmds={cmds}: {problem}"
+                f"{f' ({offline})' if offline else ''} — resending in a new websocket session"
+            )
+            haier.restart_session(entry["session"], f"a command to {self.device_name} got no answer")
+            if entry["single"]:
+                for command in pending:
+                    self._send_single_command(command, attempt=2)
+            else:
+                self._send_group_command(pending, attempt=2)
+            return
+        _LOGGER.error(
+            f"CMD LOST [{self.device_name}] trace={trace} cmds={cmds}: the resend failed too "
+            f"({problem}{f'; {offline}' if offline else ''}) — the device did not get the "
+            f"command, showing its real state"
+        )
+        self._clear_sent_by_trace(trace)
+        self._schedule_refresh_after_failure()
 
     # --- diagnostics: command / state correlation -----------------------------
     # These only log; they do not change behaviour. The goal is to confirm whether
@@ -1173,15 +1313,17 @@ class HaierDevice(object):
             when = f"{age:.2f}s after connect" if age is not None else "received"
             _LOGGER.info(f"WS SESSION READY [{self.device_name}]: first inbound message {when}")
 
-    def _record_sent(self, commands: list[dict], trace: str) -> None:
+    @classmethod
+    def _summarize(cls, commands: list[dict]) -> dict:
+        return {str(c.get("commandName")): cls._norm_value(c.get("value")) for c in commands}
+
+    def _record_sent(self, commands: list[dict], trace: str, attempt: int = 1) -> None:
         now = time.monotonic()
-        summary = {}
         with self._sent_lock:
             for c in commands:
                 code = str(c.get("commandName"))
                 val = self._norm_value(c.get("value"))
                 self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
-                summary[code] = val
         age = self._session_age()
         ready = (
             f"{now - self._session_ready_at:.2f}s ago"
@@ -1189,8 +1331,8 @@ class HaierDevice(object):
         )
         age_s = f"{age:.2f}s" if age is not None else "n/a"
         _LOGGER.info(
-            f"CMD OUT [{self.device_name}] trace={trace} cmds={summary} "
-            f"session_age={age_s} device_ready={ready}"
+            f"CMD OUT [{self.device_name}] trace={trace} cmds={self._summarize(commands)} "
+            f"session_age={age_s} device_ready={ready}{' (resend)' if attempt > 1 else ''}"
         )
 
     def _touch_sent(self, trace) -> None:
@@ -1303,16 +1445,22 @@ class HaierDevice(object):
             # Surface rejections at WARNING so a dropped/refused command is easy to diagnose.
             err_no = message_dict.get("errNo", 0)
             trace = message_dict.get("trace")
+            with self._sent_lock:
+                if not trace and self._awaiting_ack:
+                    # An answer without a trace can only be for the oldest unanswered command.
+                    trace = next(iter(self._awaiting_ack))
+                entry = self._awaiting_ack.pop(trace, None)
             latency = self._ack_latency(trace)
             if err_no not in (0, "0", None):
+                cmds = self._summarize(entry["commands"]) if entry else "?"
                 _LOGGER.warning(
                     f"CMD REJECTED [{self.device_name}] trace={trace} errNo={err_no} "
-                    f"latency={latency}: {message_dict}"
+                    f"cmds={cmds} latency={latency}: {message_dict}"
                 )
                 # set_* already applied the value optimistically — re-pull the real
                 # state so HA does not keep showing what the device refused to do.
                 self._clear_sent_by_trace(trace)
-                self._schedule_refresh_after_rejection()
+                self._schedule_refresh_after_failure()
             else:
                 _LOGGER.info(
                     f"CMD ACK [{self.device_name}] trace={trace} errNo=0 latency={latency}"
