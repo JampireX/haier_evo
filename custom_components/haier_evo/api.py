@@ -234,6 +234,8 @@ class Haier(object):
         self._connected_at = None
         # Monotonic time of the last inbound WS message (any device) — see _is_session_stale.
         self._last_inbound_at = None
+        # True while sessions the cloud sends nothing over are reported (_check_silent_session).
+        self._silent_reported = False
         self.reset_limits()
         self.register_view()
 
@@ -714,6 +716,9 @@ class Haier(object):
     # noinspection PyUnusedLocal
     def _on_message(self, ws: WebSocket, message: str) -> None:
         self._last_inbound_at = time.monotonic()
+        if self._silent_reported:
+            self._silent_reported = False
+            _LOGGER.info("The Haier cloud sends over the websocket again")
         _LOGGER.debug(f"Received WSS message: {message}")
         message_dict: dict = json.loads(message)
         message_device = str(message_dict.get("macAddress")).lower()
@@ -734,11 +739,30 @@ class Haier(object):
             ws.close()
             return
         self.socket_status = SocketStatus.INITIALIZED
-        self._connected_at = time.monotonic()
+        self._connected_at = session = time.monotonic()
         _LOGGER.debug("Websocket opened")
         for device in self.devices:
             device.reset_session_state()
             device.init_if_needed()
+        timer = threading.Timer(C.WS_SILENT_SESSION_TIMEOUT, self._check_silent_session, args=(session,))
+        timer.daemon = True
+        timer.start()
+
+    def _check_silent_session(self, session: float) -> None:
+        # The cloud pushes a status snapshot right after a session opens and answers every
+        # command. A session it has sent nothing over is accepted but not served: no updates
+        # arrive and commands are lost. Logged as a warning when it starts, then at INFO.
+        if self.disconnect_requested or session != self._connected_at or not self.devices:
+            return
+        if self._last_inbound_at is not None and self._last_inbound_at >= session:
+            return
+        log = _LOGGER.info if self._silent_reported else _LOGGER.warning
+        self._silent_reported = True
+        log(
+            f"The Haier cloud accepted the websocket session but has sent nothing over it for "
+            f"{C.WS_SILENT_SESSION_TIMEOUT:.0f}s: it delivers no device updates and no command "
+            f"answers to it. Check that the devices respond in the Evo app."
+        )
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_close(self, ws: WebSocket, close_code: int, close_message: str) -> None:
@@ -752,9 +776,12 @@ class Haier(object):
             self.invalidate_token(self._ws_token, f"WS closed: {close_code} {close_message!r}")
 
     def _wait_websocket(self, timeout: float) -> None:
+        # Waits for a usable session, not just the status flag: right after a close (e.g. by
+        # restart_session) the flag still reads INITIALIZED until _on_close runs — up to a few
+        # seconds — and a resend that trusted it failed twice and was lost.
         current = time.time()
         while time.time() <= (current + timeout):
-            if self.socket_status == SocketStatus.INITIALIZED:
+            if self._is_socket_ready():
                 _LOGGER.info(
                     f"_wait_websocket: socket became INITIALIZED after "
                     f"{time.time() - current:.2f}s"
@@ -1282,10 +1309,14 @@ class HaierDevice(object):
             else:
                 self._send_group_command(pending, attempt=2)
             return
+        silent = (
+            "; nothing has been received over the websocket since the integration started"
+            if haier._last_inbound_at is None else ""
+        )
         _LOGGER.error(
             f"CMD LOST [{self.device_name}] trace={trace} cmds={cmds}: the resend failed too "
-            f"({problem}{f'; {offline}' if offline else ''}) — the device did not get the "
-            f"command, showing its real state"
+            f"({problem}{f'; {offline}' if offline else ''}{silent}) — the device did not get "
+            f"the command, showing its real state"
         )
         self._clear_sent_by_trace(trace)
         self._schedule_refresh_after_failure()

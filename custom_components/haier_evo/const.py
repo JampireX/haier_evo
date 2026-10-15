@@ -43,6 +43,10 @@ WS_CMD_CORRELATION_WINDOW = 45.0
 # token): the session is re-established and the command resent once. A session that has not
 # delivered anything yet (the cloud is still attaching it) gets one more period first.
 WS_CMD_ACK_TIMEOUT = 10.0
+# Right after a session opens the cloud pushes a full status snapshot (observed within ~1-11s).
+# A session nothing at all has arrived over for this long is accepted but not served — it is
+# reported in the log (see Haier._check_silent_session).
+WS_SILENT_SESSION_TIMEOUT = 60.0
 # "Zombie" WS session guard: ping/pong keeps the TCP connection alive, but the server can
 # silently stop delivering application messages (observed: a 10.7h-old session with zero
 # inbound messages — the first command sent into it was lost). If nothing has been received
