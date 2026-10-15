@@ -46,7 +46,7 @@ So **adding support for a new feature or device usually means editing these tabl
 
 ### Data flow
 - **Setup**: `load_tokens` → `pull_data` (REST: parse the SDUI "smartHome" page to extract each device's type/mac/serial from deep-links) → per device `pull_device_data` (REST: detailed config + current values) → build device objects → `connect_in_thread` (open WebSocket).
-- **Realtime in**: WS message → `Haier._on_message` → routed by mac to `HaierDevice.on_message` → `_set_attribute_value` per property → `write_ha_state()` (pushed to HA via `hass.loop.call_soon_threadsafe`, because the WS runs off the event loop).
+- **Realtime in**: WS message → `Haier._on_message` → routed by mac to `HaierDevice.on_message` → `_set_attribute_value` per property → `write_ha_state()` (pushed to HA via `hass.loop.call_soon_threadsafe`, because the WS runs off the event loop). The cloud pushes a full status snapshot right after a session opens; a session nothing arrives over within `WS_SILENT_SESSION_TIMEOUT` is logged as not served (`_check_silent_session`).
 - **Commands out**: HA entity method → `device.set_*` → `get_commands` (resolves attr code + value code, applies `Constraint`) → `_send_commands` → `_send_group_command` (if the config has a `command_name`) or `_send_single_command` → WS `send`. Device state is also optimistically updated locally. The cloud answers every command with a `command_response` (same `trace`, `errNo`) in ~1 s; the ACK watchdog (`_expect_ack` / `_on_ack_timeout`, `WS_CMD_ACK_TIMEOUT`) re-establishes the WS session and resends an unanswered command once (not values the device already reports or a newer command replaced), then logs `CMD LOST` and re-pulls the real state.
 
 ### Auth & rate limiting
