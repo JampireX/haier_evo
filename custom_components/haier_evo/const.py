@@ -47,6 +47,14 @@ WS_CMD_ACK_TIMEOUT = 10.0
 # A session nothing at all has arrived over for this long is accepted but not served — it is
 # reported in the log (see Haier._check_silent_session).
 WS_SILENT_SESSION_TIMEOUT = 60.0
+# Reconnect backoff: a session that failed to open, or closed within WS_SESSION_OK_AFTER seconds
+# without delivering anything, makes the next attempt wait 5 s, 10 s, 20 s ... up to this many
+# seconds (on top of the 5 s connect rate limit). Sessions we end ourselves do not count.
+WS_RECONNECT_BACKOFF_MAX = 300
+WS_SESSION_OK_AFTER = 60
+# A REST path that answers 401 even with a freshly refreshed token is not refused because of the
+# token: for this many seconds its 401s no longer force a token refresh and a websocket restart.
+NON_TOKEN_401_TTL = 3600
 # "Zombie" WS session guard: ping/pong keeps the TCP connection alive, but the server can
 # silently stop delivering application messages (observed: a 10.7h-old session with zero
 # inbound messages — the first command sent into it was lost). If nothing has been received
@@ -78,6 +86,8 @@ TOKEN_REJECT_MIN_AGE = 60
 # programs (they all share 0 == 45), attribute 0 the others. They are matched against the
 # program definitions (businessAttributes), the more specific attribute first.
 WM_PROGRAM_ID_ATTRS = ("90", "0")
+WM_PROGRAM_ATTR = "0"
+WM_SUBPROGRAM_ATTR = "90"
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5
@@ -85,5 +95,7 @@ API_PATH = "https://evo.haieronline.ru"
 API_LOGIN = "v2/{region}/users/auth/sign-in"
 API_TOKEN_REFRESH = "v2/{region}/users/auth/refresh"
 API_DEVICES = "v2/{region}/pages/sduiRawPaginated/smartHome?part=1&partitionWeight=6"
+# Component id of the device list on that page (preferred when several "deviceList" components exist).
+DEVICE_LIST_COMPONENT_ID = "72a6d224-cb66-4e6d-b427-2e4609252684"
 API_STATUS = "https://iot-platform.evo.haieronline.ru/mobile-backend-service/api/v1/config/{mac}?type=DETAILED"
 API_WS_PATH = "wss://iot-platform.evo.haieronline.ru/gateway-ws-service/ws/"

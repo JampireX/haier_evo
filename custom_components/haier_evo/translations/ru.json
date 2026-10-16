@@ -1,24 +1,20 @@
 {
     "config": {
         "abort": {
-            "already_configured": "already configured",
+            "already_configured": "Этот аккаунт Haier Evo уже добавлен для этого региона",
+            "already_in_progress": "Этот аккаунт Haier Evo уже настраивается",
             "reauth_successful": "Пароль обновлён, интеграция перезапущена"
         },
         "error": {
-            "cannot_connect": "cannot connect",
-            "invalid_auth": "invalid_auth",
+            "cannot_connect": "Не удалось связаться с сервером Haier Evo, или он ответил ошибкой. Попробуйте позже.",
+            "invalid_auth": "Сервер Haier Evo не принял email или пароль",
+            "invalid_email": "Некорректный email",
             "invalid_password": "Некорректный пароль",
-            "unknown": "unknown"
+            "invalid_region": "Некорректный регион",
+            "unknown": "Непредвиденная ошибка, подробности в журнале"
         },
         "step": {
             "user": {
-                "data": {
-                    "password": "Пароль",
-                    "email": "Логин (email)",
-                    "region": "Регион"
-                }
-            },
-            "init": {
                 "data": {
                     "password": "Пароль",
                     "email": "Логин (email)",
@@ -30,6 +26,30 @@
                 "description": "Сервер Haier Evo не принял пароль для {email}. Введите актуальный пароль.",
                 "data": {
                     "password": "Пароль"
+                }
+            }
+        }
+    },
+    "options": {
+        "error": {
+            "already_configured": "Этот аккаунт с этим регионом уже используется в другой записи Haier Evo",
+            "cannot_connect": "Не удалось связаться с сервером Haier Evo, или он ответил ошибкой. Попробуйте позже.",
+            "invalid_auth": "Сервер Haier Evo не принял email или пароль",
+            "invalid_email": "Некорректный email",
+            "invalid_password": "Некорректный пароль",
+            "invalid_region": "Некорректный регион",
+            "unknown": "Непредвиденная ошибка, подробности в журнале"
+        },
+        "step": {
+            "init": {
+                "title": "Аккаунт Haier Evo",
+                "data": {
+                    "password": "Новый пароль",
+                    "email": "Логин (email)",
+                    "region": "Регион"
+                },
+                "data_description": {
+                    "password": "Оставьте пустым, чтобы сохранить текущий пароль."
                 }
             }
         }

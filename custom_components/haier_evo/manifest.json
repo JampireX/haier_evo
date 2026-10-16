@@ -4,11 +4,11 @@
   "codeowners": ["@and7ey", "@JampireX"],
   "config_flow": true,
   "dependencies": ["http", "frontend"],
-  "documentation": "https://github.com/and7ey/haier_evo",
+  "documentation": "https://github.com/JampireX/haier_evo",
   "homekit": {},
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/and7ey/haier_evo/issues",
+  "issue_tracker": "https://github.com/JampireX/haier_evo/issues",
   "requirements": ["websocket-client>=1.9.2", "ratelimit==2.2.1", "tenacity"],
-  "version": "0.3.26-beta.18",
+  "version": "0.3.26-beta.19",
   "zeroconf": []
 }

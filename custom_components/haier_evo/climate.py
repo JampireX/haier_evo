@@ -32,10 +32,8 @@ class HaierACEntity(ClimateEntity):
         self._attr_unique_id = f"{device.device_id}_{device.device_model}"
         self._attr_supported_features = device.get_supported_features()
         self._attr_hvac_modes = device.get_hvac_modes()
-        self._attr_fan_modes = device.get_fan_modes()
         self._attr_swing_horizontal_modes = device.get_swing_horizontal_modes()
         self._attr_swing_modes = device.get_swing_modes()
-        self._attr_preset_modes = device.get_preset_modes()
         # https://developers.home-assistant.io/blog/2024/01/24/climate-climateentityfeatures-expanded/
         self._enable_turn_on_off_backwards_compatibility = False
 
@@ -46,11 +44,24 @@ class HaierACEntity(ClimateEntity):
         self.async_on_remove(self._device.add_write_ha_state_callback(self.async_write_ha_state))
 
     @property
-    def hvac_mode(self) -> str:
+    def hvac_mode(self) -> str | None:
         """Return hvac operation ie. heat, cool mode."""
         if self._device.status == 1:
-            return self._device.mode or HVACMode.OFF
+            # A mode the integration cannot map (or none reported) is unknown, not OFF — and
+            # never a value outside hvac_modes, which made HA raise on every state write.
+            mode = self._device.mode
+            return mode if mode in self.hvac_modes else None
         return HVACMode.OFF
+
+    @property
+    def fan_modes(self) -> list[str]:
+        # Follows the device's current restrictions (e.g. no "auto" in fan-only mode).
+        return self._device.get_fan_modes()
+
+    @property
+    def preset_modes(self) -> list[str]:
+        # sleep/boost are not offered while the device makes them read-only (auto, dry, fan).
+        return self._device.get_preset_modes()
 
     @property
     def swing_horizontal_mode(self) -> str:
@@ -108,14 +119,14 @@ class HaierACEntity(ClimateEntity):
         return self._device.device_info
 
     async def async_set_temperature(self, **kwargs) -> None:
-        """Set new target temperature."""
+        """Set new target temperature (and the mode, if the service call names one)."""
         temp = kwargs.get("temperature", self.target_temperature)
-        await self.hass.async_add_executor_job(self.set_temperature, temp)
+        await self.hass.async_add_executor_job(self.set_temperature, temp, kwargs.get("hvac_mode"))
 
-    def set_temperature(self, temp: float) -> None:
+    def set_temperature(self, temp: float, hvac_mode: str | None = None) -> None:
         """Set new target temperature."""
-        _LOGGER.debug(f"Setting target temperature to {temp}")
-        self._device.set_temperature(temp)
+        _LOGGER.debug(f"Setting target temperature to {temp} (hvac_mode={hvac_mode})")
+        self._device.set_temperature(temp, hvac_mode)
 
     def set_hvac_mode(self, hvac_mode: str) -> None:
         """Set new target hvac mode."""

@@ -1,24 +1,20 @@
 {
     "config": {
         "abort": {
-            "already_configured": "already configured",
+            "already_configured": "This Haier Evo account is already added for this region",
+            "already_in_progress": "This Haier Evo account is already being set up",
             "reauth_successful": "Password updated, the integration has been reloaded"
         },
         "error": {
-            "cannot_connect": "cannot connect",
-            "invalid_auth": "invalid_auth",
+            "cannot_connect": "Could not reach the Haier Evo server, or it answered with an error. Try again later.",
+            "invalid_auth": "The Haier Evo server rejected the email or password",
+            "invalid_email": "Invalid email",
             "invalid_password": "Invalid password",
-            "unknown": "unknown"
+            "invalid_region": "Invalid region",
+            "unknown": "Unexpected error, see the log"
         },
         "step": {
             "user": {
-                "data": {
-                    "password": "Password",
-                    "email": "Login (email)",
-                    "region": "Region"
-                }
-            },
-            "init": {
                 "data": {
                     "password": "Password",
                     "email": "Login (email)",
@@ -30,6 +26,30 @@
                 "description": "The Haier Evo server rejected the password for {email}. Enter the current password.",
                 "data": {
                     "password": "Password"
+                }
+            }
+        }
+    },
+    "options": {
+        "error": {
+            "already_configured": "Another Haier Evo entry already uses this account and region",
+            "cannot_connect": "Could not reach the Haier Evo server, or it answered with an error. Try again later.",
+            "invalid_auth": "The Haier Evo server rejected the email or password",
+            "invalid_email": "Invalid email",
+            "invalid_password": "Invalid password",
+            "invalid_region": "Invalid region",
+            "unknown": "Unexpected error, see the log"
+        },
+        "step": {
+            "init": {
+                "title": "Haier Evo account",
+                "data": {
+                    "password": "New password",
+                    "email": "Login (email)",
+                    "region": "Region"
+                },
+                "data_description": {
+                    "password": "Leave empty to keep the current password."
                 }
             }
         }

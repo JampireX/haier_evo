@@ -6,18 +6,21 @@
  * сам Home Assistant (formatEntityState / formatEntityAttributeValue), поэтому они
  * совпадают с языком интерфейса; свои подписи, иконки и цвета задаются в YAML.
  *
- * Все параметры, кроме entity, необязательны:
+ * Все параметры, кроме entity, необязательны (пустое значение — значение по умолчанию):
  *   name, show_name, show_current, show_power, show_labels, compact,
  *   hide_when_off (true | [секции]), control_style ("pills" | "chips"),
  *   sections ([temperature, modes, fan, swing, swing_horizontal, preset,
  *             switches, selects, sensors] — состав и порядок),
  *   modes / fan_modes / swing_modes / swing_horizontal_modes / preset_modes
- *     (какие значения показывать и в каком порядке),
- *   switches / selects / sensors (списки сущностей; по умолчанию — всё с устройства),
+ *     (какие значения показывать и в каком порядке; без modes режим «Выкл»
+ *      не показывается, если есть кнопка питания),
+ *   switches / selects / sensors (списки сущностей; по умолчанию — всё с устройства;
+ *     в selects подходят и select, и input_select),
  *   exclude (сущности, которые не показывать), temperature_step,
  *   debounce (мс; нажатия −/+ собираются в одну команду),
  *   labels ({mode|fan|swing|swing_horizontal|preset: {значение: подпись}}),
- *   icons ({значение|секция|entity_id: "mdi:…"}), colors ({режим: цвет}),
+ *   icons ({режим | fan | swing | swing_horizontal | preset | power | increase | decrease |
+ *           current_temperature | entity_id: "mdi:…"}), colors ({режим: цвет}),
  *   accent_color, style (дополнительный CSS).
  */
 
@@ -103,13 +106,19 @@ const FALLBACK_LABELS = {
     preset: { none: "Нет", sleep: "Сон", boost: "Турбо", eco: "Эко", comfort: "Комфорт" },
 };
 
+// Keys that open a focused native <select> (or move through its open list).
+const SELECT_OPEN_KEYS = [" ", "Enter", "ArrowUp", "ArrowDown", "F4"];
+// A picker dismissed without a choice does not always report it: stop holding renders after this.
+const SELECT_HOLD_MS = 30000;
+
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => (
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 class HaierEvoAcCard extends HTMLElement {
 
-    static getConfigForm() {
-        return haierEvoAcCardForm();
+    static async getConfigElement() {
+        await loadHaForm();
+        return document.createElement("haier-evo-ac-card-editor");
     }
 
     static getStubConfig(hass) {
@@ -122,7 +131,12 @@ class HaierEvoAcCard extends HTMLElement {
         if (!config || !String(config.entity || "").startsWith("climate.")) {
             throw new Error("entity: укажите climate-сущность (climate.…)");
         }
-        this._config = { ...DEFAULTS, ...config };
+        // Another entity: a −/+ change still waiting for the debounce belongs to the previous one —
+        // send it there now (as on disconnect) and do not let its value leak into the new entity.
+        if (this._config && this._config.entity !== config.entity) this._clearPending(true);
+        // Empty values (null, or a field cleared in the visual editor) fall back to the defaults.
+        const own = Object.fromEntries(Object.entries(config).filter(([, value]) => value != null));
+        this._config = { ...DEFAULTS, ...own };
         this._key = null;
         this._render();
     }
@@ -152,7 +166,7 @@ class HaierEvoAcCard extends HTMLElement {
         const st = this._stateObj;
         if (!st || !this._config) return 3;
         const rows = { temperature: 2, modes: 1, switches: 1, selects: 1, sensors: 1 };
-        const sections = this._sections(st.state === "off");
+        const sections = this._sections(this._isOff(st));
         let size = 1 + sections.reduce((n, s) => n + (rows[s] ?? 0), 0);
         const choices = sections.filter((s) => CONTROLS[s]).length;
         size += this._config.control_style === "chips" ? choices : Math.min(choices, 1);
@@ -175,6 +189,15 @@ class HaierEvoAcCard extends HTMLElement {
 
     _t(key) {
         return TEXT[this._lang][key];
+    }
+
+    _isUnavailable(st) {
+        return st.state === "unavailable" || st.state === "unknown";
+    }
+
+    // An unavailable / unknown AC is not "on": no active power button, hide_when_off applies.
+    _isOff(st) {
+        return st.state === "off" || this._isUnavailable(st);
     }
 
     _sections(off) {
@@ -277,8 +300,18 @@ class HaierEvoAcCard extends HTMLElement {
         return this._icon(stateObj.entity_id, entry?.icon || own || SWITCH_ICONS[entry?.translation_key] || fallback);
     }
 
+    // Resolves to false when the call fails (Home Assistant shows the error to the user itself).
     _call(domain, service, data) {
-        this._hass.callService(domain, service, data);
+        try {
+            return Promise.resolve(this._hass.callService(domain, service, data)).then(() => true, () => false);
+        } catch (e) {
+            return Promise.resolve(false);
+        }
+    }
+
+    // select.* and input_select.* both have a select_option service with the same data.
+    _selectOption(entity_id, option) {
+        return this._call(entity_id.split(".")[0], "select_option", { entity_id, option });
     }
 
     /* ---------- rendering ---------- */
@@ -287,16 +320,22 @@ class HaierEvoAcCard extends HTMLElement {
         if (!this._hass || !this._config) return;
         if (!this.shadowRoot) {
             this.attachShadow({ mode: "open" });
-            this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
-            this.shadowRoot.addEventListener("change", (ev) => this._onChange(ev));
+            const root = this.shadowRoot;
+            root.addEventListener("click", (ev) => this._onClick(ev));
+            root.addEventListener("change", (ev) => this._onChange(ev));
+            root.addEventListener("pointerdown", (ev) => this._onPress(ev));
+            root.addEventListener("keydown", (ev) => this._onPress(ev));
+            root.addEventListener("focusout", (ev) => this._onFocusOut(ev));
         }
         const cfg = this._config;
         const st = this._stateObj;
-        const css = `<style>${HaierEvoAcCard.styles}${cfg.style ? `\n${cfg.style}` : ""}</style>`;
         if (!st) {
-            this._key = null;
-            this.shadowRoot.innerHTML = `${css}<ha-card><div class="warn">${esc(this._t("missing"))}: `
-                + `${esc(cfg.entity)}</div></ha-card>`;
+            const missing = JSON.stringify(["missing", cfg.entity, this._lang]);
+            if (missing !== this._key) {
+                this._key = missing;
+                this._setContent(`<ha-card><div class="warn">${esc(this._t("missing"))}: `
+                    + `${esc(cfg.entity)}</div></ha-card>`);
+            }
             return;
         }
         // The command is applied optimistically; once the entity reports it, stop showing the
@@ -305,19 +344,31 @@ class HaierEvoAcCard extends HTMLElement {
             this._pending = null;
         }
 
-        const off = st.state === "off";
+        const unavailable = this._isUnavailable(st);
+        const off = this._isOff(st);
         const sections = this._sections(off);
         const switches = sections.includes("switches") ? this._entities("switches") : [];
         const selects = sections.includes("selects") ? this._entities("selects") : [];
         const sensors = sections.includes("sensors") ? this._entities("sensors") : [];
         const key = JSON.stringify([
             st.state, st.attributes, this._pending, this._hass.language, this._hass.locale,
-            [...switches, ...selects, ...sensors].map((s) => [s.entity_id, s.state, s.attributes.options]),
+            [...switches, ...selects, ...sensors].map((s) => [s.entity_id, s.state, s.attributes]),
         ]);
-        if (key === this._key) return;
+        // Translations (the formatters) and the entity registry may arrive after the first render;
+        // Home Assistant replaces them when they change, so they are compared by identity.
+        const refs = [
+            this._hass.localize, this._hass.formatEntityState, this._hass.formatEntityAttributeValue,
+            this._hass.formatEntityAttributeName, this._hass.entities,
+        ];
+        if (key === this._key && refs.every((ref, i) => ref === this._refs?.[i])) return;
+        // A render would replace an open native <select> and close its picker: wait for the choice.
+        if (this._selectOpen()) {
+            this._deferred = true;
+            return;
+        }
         this._key = key;
+        this._refs = refs;
 
-        const unavailable = st.state === "unavailable" || st.state === "unknown";
         const body = [];
         let pills = [];
         const flushPills = () => {
@@ -351,12 +402,32 @@ class HaierEvoAcCard extends HTMLElement {
 
         const vars = [`--hac-mode:${this._modeColor(off ? "off" : st.state)}`];
         if (cfg.accent_color) vars.push(`--hac-accent:${cfg.accent_color}`);
-        this.shadowRoot.innerHTML = `${css}
+        this._setContent(`
             <ha-card class="${cfg.compact ? "compact" : ""} ${off ? "off" : ""} ${unavailable ? "unavailable" : ""}"
                      style="${esc(vars.join(";"))}">
                 ${this._renderHeader(st, off, unavailable)}
                 ${body.join("")}
-            </ha-card>`;
+            </ha-card>`);
+    }
+
+    // Replaces the card content, keeping keyboard focus on the same control. The user's CSS is set
+    // as text, so it never goes through the HTML parser (nothing in it can close the <style>).
+    _setContent(html) {
+        const root = this.shadowRoot;
+        const focused = this._controlId(root.activeElement);
+        const userCss = this._config.style ? `<style class="user"></style>` : "";
+        root.innerHTML = `<style>${HaierEvoAcCard.styles}</style>${userCss}${html}`;
+        if (userCss) root.querySelector("style.user").textContent = String(this._config.style);
+        this._deferred = false;
+        if (!focused) return;
+        [...root.querySelectorAll("[data-act]")].find((el) => this._controlId(el) === focused)
+            ?.focus({ preventScroll: true });
+    }
+
+    // A control's identity across renders: tag, action and the control / entity / value it is for.
+    _controlId(el) {
+        const data = el?.dataset;
+        return data?.act ? [el.tagName, data.act, data.k, data.e, data.v].join("|") : null;
     }
 
     _renderHeader(st, off, unavailable) {
@@ -371,9 +442,10 @@ class HaierEvoAcCard extends HTMLElement {
             sub = `<span class="sub"><ha-icon icon="${esc(this._icon("current_temperature", "mdi:thermometer"))}">`
                 + `</ha-icon>${esc(this._num(current))} ${esc(this._unit)}</span>`;
         }
+        const action = esc(this._t(off ? "turn_on" : "turn_off"));
         const power = cfg.show_power ? `
-            <button class="ic pwr ${off ? "" : "on"}" data-act="power" title="${esc(this._t(off ? "turn_on" : "turn_off"))}"
-                    aria-label="${esc(this._t(off ? "turn_on" : "turn_off"))}" aria-pressed="${!off}">
+            <button class="ic pwr ${off ? "" : "on"}" data-act="power" title="${action}"
+                    aria-label="${action}" aria-pressed="${!off}"${unavailable ? " disabled" : ""}>
                 <ha-icon icon="${esc(this._icon("power", "mdi:power"))}"></ha-icon>
             </button>` : "";
         return `<div class="hdr">
@@ -397,9 +469,11 @@ class HaierEvoAcCard extends HTMLElement {
     }
 
     _renderModes(st) {
+        // An empty list means "not listed", the same as for every other value list.
+        const listed = Array.isArray(this._config.modes) && this._config.modes.length > 0;
         let modes = this._values("mode", st.attributes.hvac_modes || []);
         // "off" is covered by the power button unless the modes are listed explicitly.
-        if (!Array.isArray(this._config.modes) && this._config.show_power) modes = modes.filter((m) => m !== "off");
+        if (!listed && this._config.show_power) modes = modes.filter((m) => m !== "off");
         if (!modes.length) return "";
         const buttons = modes.map((mode) => {
             const label = this._label("mode", mode, st);
@@ -519,7 +593,24 @@ class HaierEvoAcCard extends HTMLElement {
     _sendTemperature() {
         this._timer = null;
         if (this._pending == null || !this._hass) return;
-        this._call("climate", "set_temperature", { entity_id: this._pendingEntity, temperature: this._pending });
+        const entity_id = this._pendingEntity;
+        const temperature = this._pending;
+        const current = this._hass.states[entity_id]?.attributes.temperature;
+        if (current != null && Number(current) === temperature) {
+            // −/+ ended where it started (or at a limit): nothing to send, every command beeps.
+            this._pending = null;
+            this._key = null;
+            this._render();
+            return;
+        }
+        this._call("climate", "set_temperature", { entity_id, temperature }).then((ok) => {
+            if (ok || this._timer || this._pending !== temperature || this._pendingEntity !== entity_id) return;
+            // Rejected (Home Assistant shows the error): show the real target now, not after the timeout.
+            clearTimeout(this._resetTimer);
+            this._pending = null;
+            this._key = null;
+            this._render();
+        });
         // If the entity never reports the value (e.g. the command failed), show the real one again.
         this._resetTimer = setTimeout(() => {
             this._pending = null;
@@ -528,14 +619,26 @@ class HaierEvoAcCard extends HTMLElement {
         }, 5000);
     }
 
+    // Forgets the optimistic target; with flush, a change still waiting for the debounce is sent first.
+    _clearPending(flush) {
+        clearTimeout(this._timer);
+        if (flush && this._timer) this._sendTemperature();
+        clearTimeout(this._resetTimer);
+        this._timer = this._resetTimer = null;
+        this._pending = this._pendingEntity = null;
+    }
+
     _onClick(ev) {
         const el = ev.target?.closest?.("[data-act]");
-        if (!el || el.tagName === "SELECT" || !this._stateObj) return;
+        if (!el || el.tagName === "SELECT" || el.disabled || !this._stateObj) return;
         const st = this._stateObj;
         const entity_id = st.entity_id;
         switch (el.dataset.act) {
             case "power":
-                this._call("climate", st.state === "off" ? "turn_on" : "turn_off", { entity_id });
+                // Nothing to switch while the AC is unavailable (the button is disabled then).
+                if (!this._isUnavailable(st)) {
+                    this._call("climate", st.state === "off" ? "turn_on" : "turn_off", { entity_id });
+                }
                 break;
             case "inc":
                 this._changeTemperature(1);
@@ -552,7 +655,7 @@ class HaierEvoAcCard extends HTMLElement {
                 break;
             }
             case "select":
-                this._call("select", "select_option", { entity_id: el.dataset.e, option: el.dataset.v });
+                this._selectOption(el.dataset.e, el.dataset.v);
                 break;
             case "toggle": {
                 const target = this._hass.states[el.dataset.e];
@@ -571,13 +674,55 @@ class HaierEvoAcCard extends HTMLElement {
 
     _onChange(ev) {
         const el = ev.target;
-        if (el?.tagName !== "SELECT" || !el.value || !this._stateObj) return;
-        if (el.dataset.act === "ctl") {
+        if (el?.tagName !== "SELECT" || !this._stateObj) return;
+        let call;
+        if (el.value && el.dataset.act === "ctl") {
             const c = CONTROLS[el.dataset.k];
-            this._call("climate", c.service, { entity_id: this._stateObj.entity_id, [c.attr]: el.value });
-        } else if (el.dataset.act === "select") {
-            this._call("select", "select_option", { entity_id: el.dataset.e, option: el.value });
+            call = this._call("climate", c.service, { entity_id: this._stateObj.entity_id, [c.attr]: el.value });
+        } else if (el.value && el.dataset.act === "select") {
+            call = this._selectOption(el.dataset.e, el.value);
         }
+        // The choice closed the picker: renders held back meanwhile can run now.
+        this._releaseSelect();
+        // Once the call is done, show the entity state again: a failed (or ignored) choice must not
+        // stay selected, or picking it once more would not fire "change".
+        call?.then(() => {
+            this._key = null;
+            this._render();
+        });
+    }
+
+    // A native <select> counts as open from the press that opens its picker until a choice
+    // ("change") or until it loses focus; meanwhile renders are held back (see _render).
+    _onPress(ev) {
+        const el = ev.target;
+        const opens = el?.tagName === "SELECT" && (ev.type === "pointerdown" || SELECT_OPEN_KEYS.includes(ev.key));
+        if (opens) {
+            this._openSelect = el;
+            this._openSince = Date.now();
+        } else if (ev.type === "pointerdown" || el === this._openSelect) {
+            this._releaseSelect();
+        }
+    }
+
+    _onFocusOut(ev) {
+        if (ev.target === this._openSelect) this._releaseSelect();
+    }
+
+    _releaseSelect() {
+        if (!this._openSelect) return;
+        this._openSelect = null;
+        if (this._deferred) this._render();
+    }
+
+    _selectOpen() {
+        const el = this._openSelect;
+        if (el && el.isConnected && this.shadowRoot.activeElement === el
+            && Date.now() - this._openSince < SELECT_HOLD_MS) {
+            return true;
+        }
+        this._openSelect = null;
+        return false;
     }
 
     /* Theming: override these CSS variables from a theme or the `style` option. */
@@ -596,12 +741,13 @@ class HaierEvoAcCard extends HTMLElement {
         .warn { color: var(--error-color); }
         button { font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0;
                  cursor: pointer; -webkit-tap-highlight-color: transparent; }
+        button:disabled { cursor: default; }
         button:focus-visible, .pill:focus-within { outline: 2px solid var(--hac-accent); outline-offset: 2px; }
         ha-icon { --mdc-icon-size: 22px; }
         .ic { width: var(--hac-btn); height: var(--hac-btn); border-radius: 50%; flex: none;
               display: inline-flex; align-items: center; justify-content: center;
               color: var(--secondary-text-color); transition: background-color .15s, color .15s; }
-        .ic:hover, .mode:hover, .tg:hover, .chip:hover { background: var(--secondary-background-color); }
+        .ic:not(:disabled):hover, .mode:hover, .tg:hover, .chip:hover { background: var(--secondary-background-color); }
         .hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
         .info { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; text-align: left; }
         .name { font-size: 1rem; font-weight: 500; color: var(--primary-text-color);
@@ -650,12 +796,10 @@ class HaierEvoAcCard extends HTMLElement {
     `;
 }
 
-/* ---------- visual editor (ha-form schema; everything else is available in YAML) ---------- */
+/* ---------- visual editor (ha-form; everything else is available in YAML) ---------- */
 
-// Built when the editor opens: by then HA has set <html lang> to the user's language.
-function haierEvoAcCardForm() {
-    const ru = String(globalThis.document?.documentElement?.lang || "ru").startsWith("ru");
-    const T = ru ? {
+const EDITOR_TEXT = {
+    ru: {
         entity: "Кондиционер", name: "Название", sections: "Секции (состав и порядок)",
         control_style: "Вид списков", show_name: "Название", show_current: "Температура в комнате",
         show_power: "Кнопка питания", show_labels: "Подписи", compact: "Компактно",
@@ -663,13 +807,16 @@ function haierEvoAcCardForm() {
         modes: "Режимы (состав и порядок)", switches: "Переключатели", selects: "Списки", sensors: "Датчики",
         exclude: "Не показывать", temperature_step: "Шаг температуры", debounce: "Задержка отправки температуры, мс",
         accent_color: "Цвет акцента (CSS)", pills: "Компактные списки", chips: "Кнопки",
-        temperature: "Температура", fan: "Вентилятор", swing: "Вертикальный поток",
+        temperature: "Температура", o_modes: "Режимы", fan: "Вентилятор", swing: "Вертикальный поток",
         swing_horizontal: "Горизонтальный поток", preset: "Пресет",
         off: "Выкл", auto: "Авто", cool: "Охлаждение", heat: "Обогрев", heat_cool: "Обогрев/охлаждение",
         dry: "Осушение", fan_only: "Вентиляция",
+        h_modes: "Пусто — все режимы (без «Выкл», если есть кнопка питания)",
         h_switches: "Пусто — все переключатели устройства", h_selects: "Пусто — все списки устройства",
-        h_sensors: "Пусто — все датчики устройства",
-    } : {
+        h_sensors: "Пусто — все датчики устройства", h_temperature_step: "Пусто — шаг сущности",
+        yaml: "задаётся в YAML",
+    },
+    en: {
         entity: "Air conditioner", name: "Name", sections: "Sections (which and in what order)",
         control_style: "Choice style", show_name: "Name", show_current: "Room temperature",
         show_power: "Power button", show_labels: "Labels", compact: "Compact",
@@ -677,56 +824,146 @@ function haierEvoAcCardForm() {
         modes: "Modes (which and in what order)", switches: "Switches", selects: "Selects", sensors: "Sensors",
         exclude: "Hide entities", temperature_step: "Temperature step", debounce: "Temperature send delay, ms",
         accent_color: "Accent colour (CSS)", pills: "Compact pills", chips: "Chips",
-        temperature: "Temperature", fan: "Fan", swing: "Vertical swing", swing_horizontal: "Horizontal swing",
-        preset: "Preset", off: "Off", auto: "Auto", cool: "Cool", heat: "Heat", heat_cool: "Heat/cool",
-        dry: "Dry", fan_only: "Fan only",
+        temperature: "Temperature", o_modes: "Modes", fan: "Fan", swing: "Vertical swing",
+        swing_horizontal: "Horizontal swing", preset: "Preset",
+        off: "Off", auto: "Auto", cool: "Cool", heat: "Heat", heat_cool: "Heat/cool", dry: "Dry", fan_only: "Fan only",
+        h_modes: "Empty — all modes (without Off when there is a power button)",
         h_switches: "Empty — all switches of the device", h_selects: "Empty — all selects of the device",
-        h_sensors: "Empty — all sensors of the device",
-    };
-    const option = (v) => ({ value: v, label: T[v] || v });
-    return {
-        schema: [
-            { name: "entity", required: true, selector: { entity: { domain: "climate" } } },
-            { name: "name", selector: { text: {} } },
-            {
-                name: "sections",
-                selector: { select: { multiple: true, reorder: true, options: SECTIONS.map(option) } },
-            },
-            {
-                name: "control_style",
-                selector: { select: { mode: "dropdown", options: ["pills", "chips"].map(option) } },
-            },
-            {
-                type: "grid", name: "", schema: [
-                    { name: "show_name", selector: { boolean: {} } },
-                    { name: "show_current", selector: { boolean: {} } },
-                    { name: "show_power", selector: { boolean: {} } },
-                    { name: "show_labels", selector: { boolean: {} } },
-                    { name: "compact", selector: { boolean: {} } },
-                    { name: "hide_when_off", selector: { boolean: {} } },
-                ],
-            },
-            {
-                type: "expandable", name: "", title: T.advanced, schema: [
-                    {
-                        name: "modes",
-                        selector: { select: { multiple: true, reorder: true, options: Object.keys(MODE_ICONS).map(option) } },
-                    },
-                    { name: "switches", selector: { entity: { multiple: true } } },
-                    { name: "selects", selector: { entity: { multiple: true, domain: ["select", "input_select"] } } },
-                    { name: "sensors", selector: { entity: { multiple: true, domain: ["sensor", "binary_sensor"] } } },
-                    { name: "exclude", selector: { entity: { multiple: true } } },
-                    { name: "temperature_step", selector: { number: { min: 0.1, max: 5, step: 0.1, mode: "box" } } },
-                    { name: "debounce", selector: { number: { min: 0, max: 5000, step: 100, mode: "box" } } },
-                    { name: "accent_color", selector: { text: {} } },
-                ],
-            },
-        ],
-        computeLabel: (schema) => T[schema.name],
-        computeHelper: (schema) => T[`h_${schema.name}`],
-    };
+        h_sensors: "Empty — all sensors of the device", h_temperature_step: "Empty — the entity's step",
+        yaml: "set in YAML",
+    },
+};
+
+const editorText = (hass) => EDITOR_TEXT[String(hass?.locale?.language || hass?.language
+    || globalThis.document?.documentElement?.lang || "ru").startsWith("ru") ? "ru" : "en"];
+
+// The form shows the effective values: defaults are visible (and editable), not empty fields.
+function editorData(config) {
+    const data = { ...config };
+    for (const key of ["show_name", "show_current", "show_power", "show_labels", "compact",
+        "hide_when_off", "control_style", "debounce"]) {
+        if (data[key] == null) data[key] = DEFAULTS[key];
+    }
+    if (!Array.isArray(data.sections) || !data.sections.length) data.sections = [...DEFAULTS.sections];
+    return data;
 }
 
+// Back to the card config: cleared fields are dropped (the card falls back to its defaults), and a
+// default the form only displayed is not written unless the config had that key already.
+function editorConfig(config, data) {
+    const result = {};
+    for (const [key, value] of Object.entries(data)) {
+        const empty = value == null || value === "" || (Array.isArray(value) && !value.length);
+        const shownDefault = !(key in config) && key in DEFAULTS
+            && JSON.stringify(value) === JSON.stringify(DEFAULTS[key]);
+        if (!empty && !shownDefault) result[key] = value;
+    }
+    return result;
+}
+
+function editorSchema(config, T) {
+    const option = (v) => ({ value: v, label: T[`o_${v}`] || T[v] || v });
+    const hide = config.hide_when_off;
+    return [
+        { name: "entity", required: true, selector: { entity: { domain: "climate" } } },
+        { name: "name", selector: { text: {} } },
+        {
+            name: "sections",
+            selector: { select: { multiple: true, reorder: true, options: SECTIONS.map(option) } },
+        },
+        {
+            name: "control_style",
+            selector: { select: { mode: "dropdown", options: ["pills", "chips"].map(option) } },
+        },
+        {
+            type: "grid", name: "", schema: [
+                { name: "show_name", selector: { boolean: {} } },
+                { name: "show_current", selector: { boolean: {} } },
+                { name: "show_power", selector: { boolean: {} } },
+                { name: "show_labels", selector: { boolean: {} } },
+                { name: "compact", selector: { boolean: {} } },
+                // A list of sections is YAML-only: shown read-only, so the switch cannot replace it.
+                Array.isArray(hide)
+                    ? { name: "hide_when_off", type: "constant", value: `${hide.join(", ")} (${T.yaml})` }
+                    : { name: "hide_when_off", selector: { boolean: {} } },
+            ],
+        },
+        {
+            type: "expandable", name: "", title: T.advanced, schema: [
+                {
+                    name: "modes",
+                    selector: { select: { multiple: true, reorder: true, options: Object.keys(MODE_ICONS).map(option) } },
+                },
+                { name: "switches", selector: { entity: { multiple: true } } },
+                { name: "selects", selector: { entity: { multiple: true, domain: ["select", "input_select"] } } },
+                { name: "sensors", selector: { entity: { multiple: true, domain: ["sensor", "binary_sensor"] } } },
+                { name: "exclude", selector: { entity: { multiple: true } } },
+                { name: "temperature_step", selector: { number: { min: 0.1, max: 5, step: 0.1, mode: "box" } } },
+                { name: "debounce", selector: { number: { min: 0, max: 5000, step: 100, mode: "box" } } },
+                { name: "accent_color", selector: { text: {} } },
+            ],
+        },
+    ];
+}
+
+// ha-form is loaded lazily by Home Assistant; asking a built-in card for its editor pulls it in.
+async function loadHaForm() {
+    for (const card of ["hui-tile-card", "hui-button-card"]) {
+        if (customElements.get("ha-form")) return;
+        try {
+            await customElements.get(card)?.getConfigElement?.();
+        } catch (e) {
+            // Best effort: an <ha-form> created before the definition is upgraded once it exists.
+        }
+    }
+}
+
+class HaierEvoAcCardEditor extends HTMLElement {
+
+    setConfig(config) {
+        this._config = config || {};
+        this._update();
+    }
+
+    set hass(hass) {
+        this._hass = hass;
+        if (this._form) this._form.hass = hass;
+        else this._update();
+    }
+
+    _update() {
+        if (!this._config || !this._hass) return;
+        if (!this._form) {
+            this._form = document.createElement("ha-form");
+            this._form.addEventListener("value-changed", (ev) => this._valueChanged(ev));
+            this.appendChild(this._form);
+        }
+        const T = editorText(this._hass);
+        const hide = this._config.hide_when_off;
+        // Rebuilt only when it really changes (language, a YAML-only hide_when_off list).
+        const schemaKey = JSON.stringify([T === EDITOR_TEXT.ru, Array.isArray(hide) ? hide : null]);
+        if (schemaKey !== this._schemaKey) {
+            this._schemaKey = schemaKey;
+            this._form.schema = editorSchema(this._config, T);
+            this._form.computeLabel = (schema) => T[schema.name];
+            this._form.computeHelper = (schema) => T[`h_${schema.name}`];
+        }
+        this._form.hass = this._hass;
+        this._form.data = editorData(this._config);
+    }
+
+    _valueChanged(ev) {
+        ev.stopPropagation();
+        this._config = editorConfig(this._config, ev.detail.value);
+        this.dispatchEvent(new CustomEvent("config-changed", {
+            detail: { config: this._config }, bubbles: true, composed: true,
+        }));
+    }
+}
+
+if (!customElements.get("haier-evo-ac-card-editor")) {
+    customElements.define("haier-evo-ac-card-editor", HaierEvoAcCardEditor);
+}
 if (!customElements.get("haier-evo-ac-card")) {
     customElements.define("haier-evo-ac-card", HaierEvoAcCard);
     window.customCards = window.customCards || [];

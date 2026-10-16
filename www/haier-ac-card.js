@@ -1,5 +1,6 @@
 /**
- * Haier Evo — кастомная карточка управления кондиционером.
+ * Haier Evo — кастомная карточка управления кондиционером (устаревшая: интеграция сама
+ * подключает новую карточку custom:haier-evo-ac-card).
  *
  * Установка:
  *   1) Скопируйте этот файл в  <config>/www/haier-ac-card.js
@@ -18,10 +19,16 @@
  *          - switch.kondicioner_health
  *          - switch.kondicioner_light
  *          - switch.kondicioner_sound
+ *        debounce: 700                         # необязательно — мс: нажатия −/+ собираются в одну команду
  *
  * Тёмная тема используется по умолчанию; цвета берутся из переменных темы HA
  * с тёмными фолбэками, поэтому карточка корректно выглядит в любой теме.
  */
+
+// Wrapped in a function scope: loading the file twice (e.g. two resources) must not clash on
+// top-level declarations.
+(() => {
+"use strict";
 
 const MODE = {
   cool:     { ru: "Холод",  accent: "#3ea6ff", icon: "snow" },
@@ -43,13 +50,19 @@ const ICONS = {
   auto: '',
 };
 
+// Default delay between the last −/+ press and the set_temperature command.
+const DEBOUNCE_MS = 700;
+
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
 function svgIcon(kind, color, size = 22) {
   if (kind === "auto") {
     return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"><text x="12" y="17" text-anchor="middle"
-      font-size="15" font-weight="700" fill="${color}" font-family="inherit">A</text></svg>`;
+      font-size="15" font-weight="700" fill="${esc(color)}" font-family="inherit">A</text></svg>`;
   }
   return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none"
-    stroke="${color}" stroke-width="2">${ICONS[kind] || ""}</svg>`;
+    stroke="${esc(color)}" stroke-width="2">${ICONS[kind] || ""}</svg>`;
 }
 
 // 270° gauge geometry
@@ -63,28 +76,59 @@ function arcPath(cx, cy, r, a0deg, a1deg) {
 
 class HaierAcCard extends HTMLElement {
   setConfig(config) {
-    if (!config || !config.entity || !config.entity.startsWith("climate.")) {
+    if (!config || !String(config.entity || "").startsWith("climate.")) {
       throw new Error("Укажите climate-сущность: entity: climate.xxx");
     }
+    // Another entity: a −/+ change still waiting for the debounce is sent to the entity it was
+    // made for, and its value does not leak into the new one.
+    if (this._config && this._config.entity !== config.entity) this._clearPending(true);
     this._config = config;
     // setConfig can be called again on the same element (card editor / config change);
     // attachShadow throws if a shadow root already exists, so reuse it.
     this._root = this.shadowRoot || this.attachShadow({ mode: "open" });
     this._built = false;
+    this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
-    if (!this._built) this._build();
-    this._update();
+    this._render();
+  }
+
+  disconnectedCallback() {
+    // Do not lose a temperature change that is still waiting for the debounce.
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._sendTemp();
+    }
   }
 
   getCardSize() { return 9; }
 
   _st(id) { return this._hass && id ? this._hass.states[id] : undefined; }
 
+  // Resolves to false when the call fails (Home Assistant shows the error itself).
   _call(domain, service, data) {
-    this._hass.callService(domain, service, data);
+    try {
+      return Promise.resolve(this._hass.callService(domain, service, data)).then(() => true, () => false);
+    } catch (e) {
+      return Promise.resolve(false);
+    }
+  }
+
+  _render() {
+    if (!this._config || !this._hass) return;
+    if (!this._built) this._build();
+    this._update();
+  }
+
+  // hass changes on every state update anywhere in Home Assistant: a part is rebuilt only when
+  // what it shows has changed (rebuilding closes an open <select> and can swallow a click).
+  _changed(part, value) {
+    const key = JSON.stringify(value);
+    if (this._keys[part] === key) return false;
+    this._keys[part] = key;
+    return true;
   }
 
   _build() {
@@ -110,13 +154,18 @@ class HaierAcCard extends HTMLElement {
                background: var(--c2,#23272f); color: var(--secondary-text-color,#878d99); }
         .pwr.on { background: radial-gradient(circle at 50% 38%, #7cc4ff, var(--acc,#3ea6ff));
                   color:#fff; box-shadow:0 4px 14px rgba(62,166,255,.45); }
+        .warn { display:none; margin-top:14px; font-size:14px; color: var(--error-color, #db4437); }
+        .card.missing .warn { display:block; }
+        .card.missing > :not(.hdr):not(.warn), .card.missing .sub, .card.missing .pwr { display:none; }
         .gauge { position:relative; width:100%; height:236px; margin:6px 0 2px; }
         .gauge svg.ring { position:absolute; inset:0; width:100%; height:100%; }
         .center { position:absolute; inset:0; display:flex; flex-direction:column;
                   align-items:center; justify-content:center; pointer-events:none; }
         .mode-lbl { font-size:12px; font-weight:700; letter-spacing:2.5px;
                     text-transform:uppercase; margin-bottom:2px; }
-        .temp { font-size:70px; font-weight:700; line-height:.9; display:flex; align-items:flex-start; }
+        .temp { font-size:70px; font-weight:700; line-height:.9; display:flex; align-items:flex-start;
+                transition: opacity .15s; }
+        .temp.pending { opacity:.6; }
         .temp .deg { font-size:22px; font-weight:600; color:var(--secondary-text-color,#878d99); margin-top:8px; }
         .cur { font-size:13px; color:var(--secondary-text-color,#878d99); margin-top:10px; }
         .step { position:absolute; top:42%; width:54px; height:54px; border-radius:50%;
@@ -169,6 +218,7 @@ class HaierAcCard extends HTMLElement {
               <path d="M7.5 7.5a7 7 0 1 0 9 0"/></svg>
           </button>
         </div>
+        <div class="warn" id="missing"></div>
 
         <div class="gauge" id="gauge">
           <svg class="ring" viewBox="0 0 420 236" preserveAspectRatio="xMidYMid meet">
@@ -205,6 +255,8 @@ class HaierAcCard extends HTMLElement {
     this._root.getElementById("pwr").onclick = () => this._togglePower();
     this._root.getElementById("minus").onclick = () => this._bumpTemp(-1);
     this._root.getElementById("plus").onclick = () => this._bumpTemp(+1);
+    // A new DOM: every part has to be rendered again.
+    this._keys = {};
     this._built = true;
   }
 
@@ -220,15 +272,88 @@ class HaierAcCard extends HTMLElement {
     const e = this._entity();
     if (!e) return;
     const a = e.attributes;
-    const step = a.target_temp_step || 1;
-    let t = (a.temperature ?? a.min_temp ?? 16) + d * step;
-    t = Math.min(a.max_temp ?? 30, Math.max(a.min_temp ?? 16, t));
-    this._call("climate", "set_temperature", { entity_id: this._config.entity, temperature: t });
+    const step = Number(a.target_temp_step) || 1;
+    const lo = a.min_temp ?? 16, hi = a.max_temp ?? 30;
+    // Presses are collected: each moves the pending value, one command goes after the last one.
+    const base = this._pending ?? a.temperature ?? lo;
+    const next = Math.round((Number(base) + d * step) / step) * step;
+    this._pending = Number(Math.min(hi, Math.max(lo, next)).toFixed(2));
+    this._pendingEntity = e.entity_id;
+    clearTimeout(this._timer);
+    clearTimeout(this._resetTimer);
+    const delay = this._config.debounce != null ? Number(this._config.debounce) || 0 : DEBOUNCE_MS;
+    if (delay > 0) {
+      this._timer = setTimeout(() => this._sendTemp(), delay);
+    } else {
+      this._sendTemp();
+    }
+    this._keys.main = null;
+    this._render();
+  }
+
+  _sendTemp() {
+    this._timer = null;
+    if (this._pending == null || !this._hass) return;
+    const entity_id = this._pendingEntity;
+    const temperature = this._pending;
+    const current = this._st(entity_id)?.attributes.temperature;
+    if (current != null && Number(current) === temperature) {
+      // −/+ ended where it started (or at a limit): nothing to send, every command beeps.
+      this._pending = null;
+      this._keys.main = null;
+      this._render();
+      return;
+    }
+    this._call("climate", "set_temperature", { entity_id, temperature }).then((ok) => {
+      if (ok || this._timer || this._pending !== temperature || this._pendingEntity !== entity_id) return;
+      // Rejected (Home Assistant shows the error): show the real target now, not after the timeout.
+      clearTimeout(this._resetTimer);
+      this._pending = null;
+      this._keys.main = null;
+      this._render();
+    });
+    // If the entity never reports the value (e.g. the command failed), show the real one again.
+    this._resetTimer = setTimeout(() => {
+      this._pending = null;
+      this._keys.main = null;
+      this._render();
+    }, 5000);
+  }
+
+  // Forgets the pending target; with flush, a change still waiting for the debounce is sent first.
+  _clearPending(flush) {
+    clearTimeout(this._timer);
+    if (flush && this._timer) this._sendTemp();
+    clearTimeout(this._resetTimer);
+    this._timer = this._resetTimer = null;
+    this._pending = this._pendingEntity = null;
   }
 
   _update() {
     const e = this._entity();
-    if (!e) return;
+    this._root.querySelector(".card").classList.toggle("missing", !e);
+    if (!e) {
+      // Say so instead of showing an empty card.
+      if (this._changed("main", ["missing", this._config.entity])) {
+        this._root.getElementById("title").textContent = this._config.name || "Кондиционер";
+        this._root.getElementById("missing").textContent = `Сущность не найдена: ${this._config.entity}`;
+      }
+      return;
+    }
+    // The command is applied optimistically; once the entity reports it, stop showing the pending value.
+    if (this._pending != null && !this._timer && Number(e.attributes.temperature) === this._pending) {
+      this._pending = null;
+    }
+    if (this._changed("main", [e.state, e.attributes, this._pending])) this._updateMain(e);
+    const ecoSt = this._st(this._config.eco_sensor);
+    if (this._changed("eco", ecoSt ? [ecoSt.state, ecoSt.attributes.options] : null)) this._updateEco(ecoSt);
+    const feats = (this._config.features || []).map((id) => this._st(id)).filter(Boolean);
+    if (this._changed("feats", feats.map((st) => [st.entity_id, st.state, st.attributes.friendly_name]))) {
+      this._updateFeatures(feats);
+    }
+  }
+
+  _updateMain(e) {
     const a = e.attributes;
     // "unavailable"/"unknown" are NOT powered-on states — only a real HVAC mode is.
     const on = e.state !== "off" && e.state !== "unavailable" && e.state !== "unknown";
@@ -251,8 +376,8 @@ class HaierAcCard extends HTMLElement {
     const pwr = this._root.getElementById("pwr");
     pwr.classList.toggle("on", on);
 
-    // gauge
-    const tgt = a.temperature;
+    // gauge (a −/+ change waiting for the debounce is shown right away)
+    const tgt = this._pending ?? a.temperature;
     const lo = a.min_temp ?? 16, hi = a.max_temp ?? 30;
     const span = hi - lo;
     const frac = (tgt != null && span > 0) ? Math.min(1, Math.max(0, (tgt - lo) / span)) : 0;
@@ -267,6 +392,7 @@ class HaierAcCard extends HTMLElement {
     this._root.getElementById("modeLbl").textContent = m.ru.toUpperCase();
     this._root.getElementById("modeLbl").style.color = m.accent;
     this._root.getElementById("target").textContent = tgt != null ? Math.round(tgt) : "—";
+    this._root.querySelector(".temp").classList.toggle("pending", this._pending != null);
     this._root.getElementById("cur").textContent =
       a.current_temperature != null ? `в комнате ${Math.round(a.current_temperature)}°` : "";
     this._root.getElementById("gauge").classList.toggle("off-dim", !on);
@@ -276,9 +402,9 @@ class HaierAcCard extends HTMLElement {
       (mode) => mode === e.state,
       (mode) => {
         const md = MODE[mode] || { ru: mode, icon: "auto" };
-        return `<div class="chip ${mode === e.state ? "active" : ""}" data-mode="${mode}">
+        return `<div class="chip ${mode === e.state ? "active" : ""}" data-mode="${esc(mode)}">
           ${svgIcon(md.icon, mode === e.state ? m.accent : "var(--secondary-text-color,#878d99)")}
-          <span class="lbl">${md.ru || mode}</span></div>`;
+          <span class="lbl">${esc(md.ru || mode)}</span></div>`;
       },
       (el) => { el.querySelectorAll("[data-mode]").forEach((c) =>
         c.onclick = () => this._call("climate", "set_hvac_mode",
@@ -299,7 +425,7 @@ class HaierAcCard extends HTMLElement {
     sw.innerHTML = items.map((it, i) => {
       const active = it[1] && it[1] !== "off";
       return `<div class="pill ${active ? "active" : ""}" data-sw="${i}">
-        <span class="pd"></span><span>${it[0]}: ${SWING_RU[it[1]] || it[1] || "—"}</span></div>`;
+        <span class="pd"></span><span>${esc(it[0])}: ${esc(SWING_RU[it[1]] || it[1] || "—")}</span></div>`;
     }).join("");
     sw.querySelectorAll("[data-sw]").forEach((el) => {
       const it = items[+el.dataset.sw];
@@ -309,27 +435,33 @@ class HaierAcCard extends HTMLElement {
         this._call("climate", it[3], { entity_id: this._config.entity, [it[4]]: next });
       };
     });
+  }
 
-    // eco select
+  // eco select
+  _updateEco(ecoSt) {
     const ecoId = this._config.eco_sensor;
-    const ecoSt = this._st(ecoId);
     this._root.getElementById("ecoWrap").style.display = ecoSt ? "" : "none";
-    if (ecoSt) {
-      const eco = this._root.getElementById("eco");
-      eco.innerHTML = `<select class="eco">${(ecoSt.attributes.options || [])
-        .map((o) => `<option ${o === ecoSt.state ? "selected" : ""}>${o}</option>`).join("")}</select>`;
-      eco.querySelector("select").onchange = (ev) =>
-        this._call("select", "select_option", { entity_id: ecoId, option: ev.target.value });
-    }
+    if (!ecoSt) return;
+    const eco = this._root.getElementById("eco");
+    eco.innerHTML = `<select class="eco">${(ecoSt.attributes.options || [])
+      .map((o) => `<option value="${esc(o)}"${o === ecoSt.state ? " selected" : ""}>${esc(o)}</option>`)
+      .join("")}</select>`;
+    eco.querySelector("select").onchange = (ev) =>
+      this._call("select", "select_option", { entity_id: ecoId, option: ev.target.value }).then(() => {
+        // Show the entity state again: a failed choice must not stay selected.
+        this._keys.eco = null;
+        this._render();
+      });
+  }
 
-    // feature switches
-    const feats = (this._config.features || []).map((id) => this._st(id)).filter(Boolean);
+  // feature switches
+  _updateFeatures(feats) {
     this._root.getElementById("featWrap").style.display = feats.length ? "" : "none";
     const fc = this._root.getElementById("feats");
     fc.innerHTML = feats.map((st) => {
       const active = st.state === "on";
-      return `<div class="pill ${active ? "active" : ""}" data-ent="${st.entity_id}">
-        <span class="pd"></span><span>${st.attributes.friendly_name || st.entity_id}</span></div>`;
+      return `<div class="pill ${active ? "active" : ""}" data-ent="${esc(st.entity_id)}">
+        <span class="pd"></span><span>${esc(st.attributes.friendly_name || st.entity_id)}</span></div>`;
     }).join("");
     fc.querySelectorAll("[data-ent]").forEach((el) =>
       el.onclick = () => this._call("switch", "toggle", { entity_id: el.dataset.ent }));
@@ -353,7 +485,7 @@ class HaierAcCard extends HTMLElement {
     el.style.opacity = enabled ? "" : "0.45";
     el.style.pointerEvents = enabled ? "" : "none";
     el.innerHTML = list.map((v) =>
-      `<button class="${v === current ? "active" : ""}" data-v="${v}">${label(v)}</button>`).join("");
+      `<button class="${v === current ? "active" : ""}" data-v="${esc(v)}">${esc(label(v))}</button>`).join("");
     el.querySelectorAll("button").forEach((b) =>
       b.onclick = () => { if (enabled) onPick(b.dataset.v); });
   }
@@ -369,13 +501,16 @@ class HaierAcCard extends HTMLElement {
   }
 }
 
-customElements.define("haier-ac-card", HaierAcCard);
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "haier-ac-card",
-  name: "Haier Evo AC Card",
-  description: "Карточка управления кондиционером Haier Evo (тёмная тема).",
-  preview: true,
-});
-console.info("%c HAIER-AC-CARD %c loaded ", "background:#3ea6ff;color:#fff;border-radius:4px 0 0 4px;padding:2px 6px",
-  "background:#23272f;color:#3ea6ff;border-radius:0 4px 4px 0;padding:2px 6px");
+if (!customElements.get("haier-ac-card")) {
+  customElements.define("haier-ac-card", HaierAcCard);
+  window.customCards = window.customCards || [];
+  window.customCards.push({
+    type: "haier-ac-card",
+    name: "Haier AC Card (legacy)",
+    description: "Устаревшая карточка кондиционера Haier Evo (тёмная тема); новая — Haier Evo AC Card.",
+    preview: true,
+  });
+  console.info("%c HAIER-AC-CARD %c loaded ", "background:#3ea6ff;color:#fff;border-radius:4px 0 0 4px;padding:2px 6px",
+    "background:#23272f;color:#3ea6ff;border-radius:0 4px 4px 0;padding:2px 6px");
+}
+})();
