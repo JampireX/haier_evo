@@ -18,6 +18,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 
 class HaierSensor(SensorEntity):
+    # Values are pushed (device callbacks -> async_write_ha_state), nothing to poll.
+    _attr_should_poll = False
     _attr_has_entity_name = True
 
     def __init__(self, device: api.HaierDevice):
@@ -133,5 +135,7 @@ class HaierWMStatusSensor(HaierSensor):
         self._attr_translation_key = "wm_status"
 
     @property
-    def native_value(self) -> str:
-        return str(getattr(self._device, self._device_attr_name, "unknown"))
+    def native_value(self) -> str | None:
+        # None (not reported yet) is HA's "unknown" state, not the text "None".
+        value = getattr(self._device, self._device_attr_name, None)
+        return None if value is None else str(value)

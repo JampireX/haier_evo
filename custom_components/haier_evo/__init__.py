@@ -44,6 +44,15 @@ def _is_rate_limited(exc: BaseException | None) -> bool:
     return False
 
 
+async def _async_stop(hass: HomeAssistant, haier_object: api.Haier) -> None:
+    # stop() ends the websocket session: keep that socket work off the event loop. A failure
+    # here must not mask the setup error being raised or fail the unload.
+    try:
+        await hass.async_add_executor_job(haier_object.stop)
+    except Exception as e:
+        _LOGGER.warning(f"Error stopping {haier_object!r}: {e!r}")
+
+
 async def _async_register_frontend(hass: HomeAssistant, version: str) -> None:
     if hass.data.get(f"{DOMAIN}_frontend_registered"):
         return
@@ -71,7 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.async_add_executor_job(haier_object.pull_data)
     except Exception as e:
         # Release the half-initialised object, so a retry starts from scratch.
-        haier_object.stop()
+        await _async_stop(hass, haier_object)
         if isinstance(e, api.InvalidCredentials):
             raise ConfigEntryAuthFailed(str(e)) from e
         if not isinstance(e, (api.InvalidAuth, api.InvalidDevicesList, RequestException, RetryError)):
@@ -108,7 +117,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         haier_object = entry.runtime_data
         _LOGGER.debug(f'Integration {haier_object} unload...')
-        haier_object.stop()
+        await _async_stop(hass, haier_object)
     return unload_ok
 
 
