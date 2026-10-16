@@ -1236,13 +1236,19 @@ class HaierDevice(object):
             f")"
         )
 
+    @staticmethod
+    def _registry_text(value) -> str | None:
+        # The device registry takes strings only: HA logs other types until 2026.12 and then
+        # rejects them, and the firmware version may come from the cloud as a number.
+        return None if value is None else str(value)
+
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(C.DOMAIN, self.device_id)},
-            name=self.device_name,
-            sw_version=self.sw_version,
-            model=self.device_model,
+            name=self._registry_text(self.device_name),
+            sw_version=self._registry_text(self.sw_version),
+            model=self._registry_text(self.device_model),
             manufacturer="Haier"
         )
 
