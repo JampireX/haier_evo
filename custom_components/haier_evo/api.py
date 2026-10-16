@@ -258,12 +258,16 @@ class Haier(object):
         self._connected_at = None
         # Monotonic time of the last inbound WS message (any device) — see _is_session_stale.
         self._last_inbound_at = None
-        # True while sessions the cloud sends nothing over are reported (_check_silent_session).
-        self._silent_reported = False
+        # Consecutive sessions the cloud has sent nothing over (_check_silent_session drops
+        # them); reset by the first inbound message.
+        self._silent_sessions = 0
+        # True while the current session is being dropped for silence: connect() then backs off.
+        self._session_silent = False
         # REST paths whose 401 turned out not to be a token problem -> monotonic expiry time.
         self._non_token_401: dict[str, float] = {}
-        # Set by stop(): wakes the reconnect backoff wait in connect().
-        self._stop_event = threading.Event()
+        # Wakes the reconnect backoff wait in connect(): set by stop(), and by a command that
+        # needs the session (connect_if_needed), so it does not sit out the whole delay.
+        self._wake_event = threading.Event()
         # True when the current WS session was ended by us (_drop_session), not by a failure.
         self._session_dropped = False
         # Serializes heartbeat() runs (the interval timer does not wait for the previous run).
@@ -396,7 +400,7 @@ class Haier(object):
 
     def stop(self) -> None:
         self.disconnect_requested = True
-        self._stop_event.set()
+        self._wake_event.set()
         self._reset_limits_if_alone()
         # Non-blocking: the WS thread tears the session down and its connect() loop exits.
         self._drop_session()
@@ -589,7 +593,7 @@ class Haier(object):
             if action is not None:
                 self.login(refresh=action == "refresh")
 
-    def invalidate_token(self, rejected: str | None, reason: str) -> bool:
+    def invalidate_token(self, rejected: str | None, reason: str, rejected_by_server: bool = True) -> bool:
         # The server rejected an access token that is still valid by the LOCAL expiry clock
         # (revoked server-side, clock skew, stale token file). auth() only compares that clock,
         # so without this the dead token was reused until its local expiry: the WS reconnected
@@ -605,7 +609,10 @@ class Haier(object):
                 # only spin the auth endpoints; let it age first.
                 _LOGGER.debug(f"Fresh access token rejected ({reason}), not refreshing yet")
                 return False
-            _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
+            if rejected_by_server:
+                _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
+            else:
+                _LOGGER.info(f"Forcing an access token refresh: {reason}")
             self.tokenexpire = None
             self.save_tokens()
             return True
@@ -857,8 +864,8 @@ class Haier(object):
     # noinspection PyUnusedLocal
     def _on_message(self, ws: WebSocket, message: str) -> None:
         self._last_inbound_at = time.monotonic()
-        if self._silent_reported:
-            self._silent_reported = False
+        if self._silent_sessions:
+            self._silent_sessions = 0
             _LOGGER.info("The Haier cloud sends over the websocket again")
         _LOGGER.debug(f"Received WSS message: {message}")
         message_dict: dict = json.loads(message)
@@ -892,20 +899,40 @@ class Haier(object):
     def _check_silent_session(self, session: float) -> None:
         # The cloud pushes a status snapshot right after a session opens and answers every
         # command. A session it has sent nothing over is accepted but not served: no updates
-        # arrive and commands are lost. Logged as a warning when it starts, then at INFO.
+        # arrive and commands are lost. It is dropped here and connect() opens the next one
+        # after a growing delay (silent sessions count as failed there): a silent session has
+        # been seen followed by a served one. The WS_SILENT_SESSIONS_FRESH_TOKEN-th silent
+        # session in a row is re-established with a freshly refreshed access token, in case
+        # the cloud serves only the sessions of its newest token. The first silent session is
+        # logged as a warning, the following ones at INFO (runs in a timer thread).
         if self.disconnect_requested or session != self._connected_at or not self.devices:
             return
-        if not self._is_socket_ready():
-            return  # the session is gone (closed, being re-established) — not a silent one
-        if self._last_inbound_at is not None and self._last_inbound_at >= session:
-            return
-        log = _LOGGER.info if self._silent_reported else _LOGGER.warning
-        self._silent_reported = True
-        log(
-            f"The Haier cloud accepted the websocket session but has sent nothing over it for "
-            f"{C.WS_SILENT_SESSION_TIMEOUT:.0f}s: it delivers no device updates and no command "
-            f"answers to it. Check that the devices respond in the Evo app."
-        )
+        with self._restart_lock:
+            if self.disconnect_requested or session != self._connected_at or not self._is_socket_ready():
+                return  # the session is gone (closed, being re-established) — not a silent one
+            if self._last_inbound_at is not None and self._last_inbound_at >= session:
+                return
+            self._silent_sessions = count = self._silent_sessions + 1
+            if count == 1:
+                _LOGGER.warning(
+                    f"The Haier cloud accepted the websocket session but has sent nothing over it "
+                    f"for {C.WS_SILENT_SESSION_TIMEOUT:.0f}s: it delivers no device updates and no "
+                    f"command answers to it. Re-establishing the session; check that the devices "
+                    f"respond in the Evo app."
+                )
+            else:
+                _LOGGER.info(
+                    f"The Haier cloud has sent nothing over the websocket session again for "
+                    f"{C.WS_SILENT_SESSION_TIMEOUT:.0f}s ({count} silent sessions in a row), "
+                    f"re-establishing it"
+                )
+            if count == C.WS_SILENT_SESSIONS_FRESH_TOKEN:
+                self.invalidate_token(
+                    self._ws_token, f"{count} websocket sessions in a row were silent",
+                    rejected_by_server=False,
+                )
+            self._session_silent = True
+            self._force_reconnect()
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_close(self, ws: WebSocket, close_code: int, close_message: str) -> None:
@@ -1022,6 +1049,8 @@ class Haier(object):
                 "connect_if_needed: socket thread is alive, waiting for it to come up "
                 f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)})"
             )
+            # A reconnect backoff in progress ends now: a command needs the session.
+            self._wake_event.set()
             return self._wait_websocket(timeout)
         # No live thread: start one. Note that connect_in_thread does NOT block, so the
         # caller may re-check the connection before it is actually up — a frequent reason
@@ -1038,23 +1067,32 @@ class Haier(object):
         while not self.disconnect_requested:
             opened_before = self._connected_at
             self._session_dropped = False
+            self._session_silent = False
             self.run_forever()
             if self.disconnect_requested:
                 break
-            # Back off when sessions keep failing (refused, or closed before delivering anything),
-            # instead of reconnecting every 5 s forever. Sessions we dropped ourselves are fine.
+            # Back off when sessions keep failing (refused, closed before delivering anything, or
+            # dropped for silence), instead of reconnecting every 5 s forever. Sessions we dropped
+            # ourselves for other reasons are fine.
             opened = self._connected_at if self._connected_at != opened_before else None
-            served = opened is not None and (
+            silent = self._session_silent
+            served = not silent and opened is not None and (
                 (self._last_inbound_at or 0) >= opened
                 or time.monotonic() - opened >= C.WS_SESSION_OK_AFTER
             )
-            if served or self._session_dropped:
+            if served or (self._session_dropped and not silent):
                 failures = 0
                 continue
             failures += 1
             delay = min(5 * 2 ** (failures - 1), C.WS_RECONNECT_BACKOFF_MAX)
-            _LOGGER.info(f"Websocket session failed ({failures} in a row), next attempt in {delay}s")
-            self._stop_event.wait(delay)
+            _LOGGER.info(
+                f"Websocket session {'stayed silent' if silent else 'failed'} ({failures} in a row), "
+                f"next attempt in {delay}s"
+            )
+            # stop() and a command that needs the session (connect_if_needed) cut the wait short.
+            self._wake_event.clear()
+            if not self.disconnect_requested:
+                self._wake_event.wait(delay)
         _LOGGER.debug("Connection stoped")
 
     def connect_in_thread(self) -> None:

@@ -9,6 +9,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/JampireX/haier_evo/issues",
   "requirements": ["websocket-client>=1.9.2", "ratelimit==2.2.1", "tenacity"],
-  "version": "0.3.26-beta.20",
+  "version": "0.3.26-beta.21",
   "zeroconf": []
 }
