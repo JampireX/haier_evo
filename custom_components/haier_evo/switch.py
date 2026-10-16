@@ -43,13 +43,25 @@ def async_migrate_http_switches(hass: HomeAssistant, entry_id: str) -> None:
             # Already moved before (an older version re-created the old one): drop the leftover.
             ent_reg.async_remove(entity_id)
     dev_reg = dr.async_get(hass)
-    device = dev_reg.async_get_device(identifiers={_LEGACY_HTTP_DEVICE})
-    if (
-        device is not None
-        and entry_id in device.config_entries
-        and dev_reg.async_get_device(identifiers={http_device_identifier(entry_id)}) is None
-    ):
+    device = _entry_device(dev_reg, _LEGACY_HTTP_DEVICE, entry_id)
+    if device is not None and _entry_device(dev_reg, http_device_identifier(entry_id), entry_id) is None:
         dev_reg.async_update_device(device.id, new_identifiers={http_device_identifier(entry_id)})
+
+
+def _entry_device(dev_reg, identifier: tuple[str, str], entry_id: str):
+    """The config entry's device with this identifier, or None.
+
+    Since HA 2026.8 a device belongs to one config entry and an identifier may name one device
+    per entry, so the lookup is scoped to the entry: `async_get_device` is deprecated (removed
+    in 2027.8) and so is `DeviceEntry.config_entries` (2027.10). Older HA has neither the
+    scoped lookup nor single-entry devices: there one device is shared by its entries."""
+    get_by_identifier = getattr(dev_reg, "async_get_device_by_identifier", None)
+    if get_by_identifier is not None:
+        return get_by_identifier(identifier, entry_id)
+    device = dev_reg.async_get_device(identifiers={identifier})
+    if device is None or entry_id not in device.config_entries:
+        return None
+    return device
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
