@@ -44,12 +44,16 @@ WS_CMD_CORRELATION_WINDOW = 45.0
 # delivered anything yet (the cloud is still attaching it) gets one more period first.
 WS_CMD_ACK_TIMEOUT = 10.0
 # Right after a session opens the cloud pushes a full status snapshot (observed within ~1-11s).
-# A session nothing at all has arrived over for this long is accepted but not served — it is
-# reported in the log (see Haier._check_silent_session).
+# A session nothing at all has arrived over for this long is accepted but not served: it is
+# dropped and re-established (see Haier._check_silent_session; connect() backs off while the
+# sessions stay silent), the WS_SILENT_SESSIONS_FRESH_TOKEN-th silent session in a row with a
+# freshly refreshed access token.
 WS_SILENT_SESSION_TIMEOUT = 60.0
+WS_SILENT_SESSIONS_FRESH_TOKEN = 2
 # Reconnect backoff: a session that failed to open, or closed within WS_SESSION_OK_AFTER seconds
 # without delivering anything, makes the next attempt wait 5 s, 10 s, 20 s ... up to this many
-# seconds (on top of the 5 s connect rate limit). Sessions we end ourselves do not count.
+# seconds (on top of the 5 s connect rate limit). Sessions dropped for silence count too;
+# sessions we end ourselves for other reasons do not.
 WS_RECONNECT_BACKOFF_MAX = 300
 WS_SESSION_OK_AFTER = 60
 # A REST path that answers 401 even with a freshly refreshed token is not refused because of the
