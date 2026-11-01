@@ -194,6 +194,16 @@ def _ws_ssl_context(timeout: float) -> ssl.SSLContext:
     return context
 
 
+def _ws_sockopt() -> tuple:
+    # The TCP connect has no timeout in websocket-client either (only a process-wide default,
+    # which would change every other integration's websockets): an unanswered SYN waited for
+    # the kernel to give up, about 2 min. TCP_SYNCNT caps the SYN retransmissions instead.
+    syncnt = getattr(socket, "TCP_SYNCNT", None)  # Linux only
+    if syncnt is None:
+        return ()
+    return ((socket.IPPROTO_TCP, syncnt, C.WS_CONNECT_SYN_RETRIES),)
+
+
 def _log_send_message_failure(retry_state):
     # Called by tenacity once send_message has exhausted every attempt (the device's ACK
     # watchdog still resends the command once, see HaierDevice._on_ack_timeout). We always log
@@ -277,6 +287,9 @@ class Haier(object):
         # their entities on the fly through the platforms' async_add_entities.
         self._pending_devices: list[dict] = []
         self._platform_add_entities: dict[str, Callable] = {}
+        # The last device discovery found the Evo page without any device (async_setup_entry
+        # retries the setup then, if the entry had devices).
+        self.no_devices_listed = False
         self.socket_app: WebSocketApp | None = None
         # TLS options of the websocket (a context with the connect timeout), made on first use.
         self._ws_sslopt: dict | None = None
@@ -736,12 +749,14 @@ class Haier(object):
                 continue
             self.devices.append(device)
             _LOGGER.info(f"Added device: {device}")
+        self.no_devices_listed = not specs
         if self.devices:
             self.connect_in_thread()
         elif not specs:
             _LOGGER.warning(
                 f"No devices found on the Evo «Мой дом» page (its components: {components}). "
-                f"If the Evo app shows devices, the page format has changed."
+                f"If the Evo app shows devices, the cloud is failing right now or the page "
+                f"format has changed."
             )
 
     @staticmethod
@@ -1205,6 +1220,7 @@ class Haier(object):
             self.socket_app.run_forever(
                 ping_interval=C.WS_PING_INTERVAL,
                 ping_timeout=C.WS_PING_TIMEOUT,
+                sockopt=_ws_sockopt(),
                 sslopt=self._ws_sslopt,
             )
         except Exception as e:
@@ -2118,6 +2134,7 @@ class HaierAC(HaierDevice):
         config.merge_attributes()
         config.constraint.extend(data.get("constraint") or [])
         config.modifiers = [CFG.Modifier(m) for m in data.get("modifiers") or [] if isinstance(m, dict)]
+        first = self._config is None  # the attributes are logged on the first load only
         self._config = config
         skip = self._stale_codes(config)
         for attr in config.attrs:
@@ -2132,7 +2149,8 @@ class HaierAC(HaierDevice):
                     self.min_temperature = min_value
                 if max_value is not None:
                     self.max_temperature = max_value
-            _LOGGER.debug(f"{self.device_name}: {attr}")
+            if first:
+                _LOGGER.debug(f"{self.device_name}: {attr}")
 
     def _get_status(self, data: dict) -> dict:
         data = super()._get_status(data)
@@ -2492,12 +2510,14 @@ class HaierREF(HaierDevice):
         config = CFG.HaierREFConfig(self.device_model, self.hass.config.path(C.DOMAIN))
         config.attrs.extend(sorted(map(CFG.Attribute, data.get("attributes") or []), key=CFG.Attribute.sort_key))
         config.merge_attributes()
+        first = self._config is None  # the attributes are logged on the first load only
         self._config = config
         skip = self._stale_codes(config)
         for attr in config.attrs:
             if str(attr.code) not in skip:
                 self._set_attribute_value(str(attr.code), attr.current)
-            _LOGGER.debug(f"{self.device_name}: {attr}")
+            if first:
+                _LOGGER.debug(f"{self.device_name}: {attr}")
 
     def _set_attribute_value(self, code: str, value: str) -> None:
         attr = self.config.get_attr_by_code(code)
@@ -2714,12 +2734,14 @@ class HaierWM(HaierDevice):
         self._parse_programs(self.status_data)
         self._parse_monitoring(self.status_data)
         self._complete_options(config)
+        first = self._config is None  # the attributes are logged on the first load only
         self._config = config
         skip = self._stale_codes(config)
         for attr in config.attrs:
             if str(attr.code) not in skip:
                 self._set_attribute_value(str(attr.code), attr.current)
-            _LOGGER.debug(f"{self.device_name}: {attr}")
+            if first:
+                _LOGGER.debug(f"{self.device_name}: {attr}")
         self._update_program()
 
     def _set_attribute_value(self, code: str, value: str) -> None:

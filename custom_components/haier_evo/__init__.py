@@ -11,6 +11,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.loader import async_get_integration
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
 from .logger import _LOGGER
 from .const import DOMAIN, WS_HEARTBEAT_INTERVAL, LOGIN_LIMIT_429, LOGIN_LIMIT_MAX
@@ -78,6 +79,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await hass.async_add_executor_job(haier_object.load_tokens)
         await hass.async_add_executor_job(haier_object.pull_data)
+        if haier_object.no_devices_listed and dr.async_entries_for_config_entry(
+            dr.async_get(hass), entry.entry_id
+        ):
+            # The Evo page listed none of the devices this entry has: the cloud is failing (in a
+            # user's log the setup 4 s later found them all). HA retries the setup, instead of the
+            # entry loading without devices until a manual reload.
+            raise api.InvalidDevicesList("the Evo «Мой дом» page listed none of this entry's devices")
     except Exception as e:
         # Release the half-initialised object, so a retry starts from scratch.
         await _async_stop(hass, haier_object)

@@ -22,9 +22,15 @@ WS_PING_INTERVAL = 10
 WS_PING_TIMEOUT = 5
 # Seconds a websocket connection attempt has for its TLS handshake and its HTTP upgrade (also the
 # socket timeout of the open session). websocket-client sets none: a server that accepted the TCP
-# connection and never answered kept the WS thread connecting for good, commands failed with
-# «Socket not ready» and only a reload of the integration helped.
+# connection and never answered would keep the WS thread connecting for good (commands failing
+# with «Socket not ready» until a reload of the integration).
 WS_CONNECT_TIMEOUT = 30
+# SYN retransmissions of the websocket's TCP connect before it gives up (Linux TCP_SYNCNT; other
+# systems keep their default). The kernel default (6) waits about 2 min: in a user's log a
+# reconnect hung 135 s on an unanswered SYN while a new connection went through at once. 2 gives
+# up after about 7 s (1 + 2 + 4 s of retransmission timeouts), then connect() makes the next
+# attempt.
+WS_CONNECT_SYN_RETRIES = 2
 # After a successful send() we wait this long and re-check the socket: a half-open
 # connection can close a few ms after send() returned (no exception raised), silently
 # losing the command. If the socket is down by then we raise to trigger the retry/resend.
