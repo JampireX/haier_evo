@@ -20,6 +20,11 @@ API_TIMEOUT = 15
 # idle is buffered into the dead socket and lost. WS_PING_TIMEOUT must be < WS_PING_INTERVAL.
 WS_PING_INTERVAL = 10
 WS_PING_TIMEOUT = 5
+# Seconds a websocket connection attempt has for its TLS handshake and its HTTP upgrade (also the
+# socket timeout of the open session). websocket-client sets none: a server that accepted the TCP
+# connection and never answered kept the WS thread connecting for good, commands failed with
+# «Socket not ready» and only a reload of the integration helped.
+WS_CONNECT_TIMEOUT = 30
 # After a successful send() we wait this long and re-check the socket: a half-open
 # connection can close a few ms after send() returned (no exception raised), silently
 # losing the command. If the socket is down by then we raise to trigger the retry/resend.

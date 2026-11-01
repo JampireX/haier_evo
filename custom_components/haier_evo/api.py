@@ -7,6 +7,7 @@ import time
 import threading
 import uuid
 import socket
+import ssl
 import weakref
 from collections.abc import Callable
 from aiohttp import web
@@ -167,6 +168,32 @@ class AuthResponse(object):
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
 
 
+class _TimeoutSSLContext(ssl.SSLContext):
+    # websocket-client opens the websocket without a socket timeout, so a TLS handshake or an
+    # HTTP upgrade the server never answers blocks run_forever() forever. The context it is
+    # given (sslopt) wraps the TCP socket right before the TLS handshake: the timeout is set there.
+    timeout: float | None = None
+
+    def wrap_socket(self, sock, *args, **kwargs):
+        sock.settimeout(self.timeout)
+        return super().wrap_socket(sock, *args, **kwargs)
+
+
+def _ws_ssl_context(timeout: float) -> ssl.SSLContext:
+    # What websocket-client sets up itself when no context is given: certificate and host name
+    # checks, the system CA certificates or the bundle named by WEBSOCKET_CLIENT_CA_BUNDLE.
+    context = _TimeoutSSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.timeout = timeout
+    bundle = os.environ.get("WEBSOCKET_CLIENT_CA_BUNDLE")
+    if bundle and os.path.isfile(bundle):
+        context.load_verify_locations(cafile=bundle)
+    elif bundle and os.path.isdir(bundle):
+        context.load_verify_locations(capath=bundle)
+    else:
+        context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+    return context
+
+
 def _log_send_message_failure(retry_state):
     # Called by tenacity once send_message has exhausted every attempt (the device's ACK
     # watchdog still resends the command once, see HaierDevice._on_ack_timeout). We always log
@@ -251,6 +278,8 @@ class Haier(object):
         self._pending_devices: list[dict] = []
         self._platform_add_entities: dict[str, Callable] = {}
         self.socket_app: WebSocketApp | None = None
+        # TLS options of the websocket (a context with the connect timeout), made on first use.
+        self._ws_sslopt: dict | None = None
         self.disconnect_requested = False
         self.socket_status: SocketStatus = SocketStatus.PRE_INITIALIZATION
         self.socket_thread = None
@@ -420,11 +449,21 @@ class Haier(object):
             return False
         app.keep_running = False
         self._session_dropped = True
-        for action in (sock.send_close, sock.abort):
+        try:
+            sock.send_close()
+        except Exception as e:
+            _LOGGER.debug(f"Error dropping the websocket session: {e!r}")
+        # Not WebSocket.abort(): it only acts on a `connected` socket, and send_close() has just
+        # cleared that flag (an attempt still waiting for the upgrade never had it). The TCP
+        # socket itself is shut down, so the read the WS thread is blocked in returns at once.
+        # socket.socket.shutdown, not SSLSocket.shutdown(): that one also drops the SSL object
+        # the WS thread may be reading through at this very moment.
+        raw = getattr(sock, "sock", None)
+        if raw is not None:
             try:
-                action()
+                socket.socket.shutdown(raw, socket.SHUT_RDWR)
             except Exception as e:
-                _LOGGER.debug(f"Error dropping the websocket session: {e!r}")
+                _LOGGER.debug(f"Error shutting the websocket down: {e!r}")
         return True
 
     @common_limits.sleep_and_retry
@@ -847,6 +886,8 @@ class Haier(object):
     def _init_ws(self) -> None:
         self.auth()
         self._ws_token = self.token
+        if self._ws_sslopt is None:
+            self._ws_sslopt = {"context": _ws_ssl_context(C.WS_CONNECT_TIMEOUT)}
         url = urljoin(C.API_WS_PATH, self.token)
         if self.socket_app is None:
             self.socket_app = WebSocketApp(
@@ -980,7 +1021,7 @@ class Haier(object):
         # restart_session) the flag still reads INITIALIZED until _on_close runs — up to a few
         # seconds — and a resend that trusted it failed twice and was lost.
         current = time.time()
-        while time.time() <= (current + timeout):
+        while time.time() <= (current + timeout) and not self.disconnect_requested:
             if self._is_socket_ready():
                 _LOGGER.info(
                     f"_wait_websocket: socket became INITIALIZED after "
@@ -988,6 +1029,8 @@ class Haier(object):
                 )
                 return
             time.sleep(0.1)
+        if self.disconnect_requested:
+            return
         _LOGGER.warning(
             f"_wait_websocket: timed out after {timeout}s waiting for the websocket to "
             f"become INITIALIZED (socket_status="
@@ -1044,6 +1087,8 @@ class Haier(object):
             return True
 
     def connect_if_needed(self, timeout: float = 4.0) -> None:
+        if self.disconnect_requested:
+            return
         if self.socket_thread and self.socket_thread.is_alive():
             _LOGGER.info(
                 "connect_if_needed: socket thread is alive, waiting for it to come up "
@@ -1160,9 +1205,15 @@ class Haier(object):
             self.socket_app.run_forever(
                 ping_interval=C.WS_PING_INTERVAL,
                 ping_timeout=C.WS_PING_TIMEOUT,
+                sslopt=self._ws_sslopt,
             )
         except Exception as e:
             _LOGGER.error(f"Error connecting to websocket: {e}")
+        finally:
+            # No session came up (sign-in or connection failed): not "connecting" any more while
+            # connect() waits for the next attempt.
+            if self.socket_status == SocketStatus.INITIALIZING:
+                self.socket_status = SocketStatus.NOT_INITIALIZED
 
     @retry(
         retry=retry_if_exception_type(Exception),
@@ -1180,6 +1231,14 @@ class Haier(object):
         #      (which reconnects and resends; all our commands carry absolute values, so a
         #       duplicate resend is harmless).
         # Returns True once the payload is on the wire, False when every attempt failed.
+        if self.disconnect_requested:
+            # The entry is unloaded (e.g. a command still waiting while it was reloaded) or its
+            # sign-in was rejected: this instance opens no websocket any more.
+            _LOGGER.info(
+                f"Command not sent: the integration entry is unloaded or its sign-in was rejected. "
+                f"Payload: {payload}"
+            )
+            return False
         with self._send_lock:
             if not self._is_socket_ready():
                 _LOGGER.warning(
