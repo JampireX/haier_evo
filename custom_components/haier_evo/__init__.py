@@ -14,7 +14,9 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval
 from .logger import _LOGGER
-from .const import DOMAIN, WS_HEARTBEAT_INTERVAL, LOGIN_LIMIT_429, LOGIN_LIMIT_MAX
+from .const import (
+    DOMAIN, WS_HEARTBEAT_INTERVAL, LOGIN_LIMIT_429, LOGIN_LIMIT_MAX, WM_ACTIVE_POLL_TICK,
+)
 from . import api
 
 
@@ -116,6 +118,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(
         async_track_time_interval(hass, _heartbeat, timedelta(seconds=WS_HEARTBEAT_INTERVAL))
+    )
+
+    # A washing machine that is on is re-read over REST every ~15 s: the cloud pushes the phase
+    # and the remaining time of a wash only every few minutes (see Haier.poll_active_laundry).
+    # The check itself is cheap and stays on the event loop while every machine is off.
+    async def _poll_laundry(now) -> None:
+        if haier_object.wants_laundry_poll():
+            await hass.async_add_executor_job(haier_object.poll_active_laundry)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _poll_laundry, timedelta(seconds=WM_ACTIVE_POLL_TICK))
     )
     return True
 

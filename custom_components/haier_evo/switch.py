@@ -69,9 +69,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
     # Before the entities are added: they must find their registry entries under the new ids.
     async_migrate_http_switches(hass, config_entry.entry_id)
     haier_object.register_platform("switch", async_add_entities)
-    entities = []
-    for device in haier_object.devices:
-        entities.extend(device.create_entities_switch())
+    entities = haier_object.platform_entities("switch")
     entities.append(HttpSwitch(haier_object, config_entry.entry_id))
     entities.append(HttpSwitchPOST(haier_object, config_entry.entry_id))
     async_add_entities(entities)

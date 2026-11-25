@@ -50,6 +50,17 @@ class AuthValidationError(AuthError):
 class AuthInternalError(AuthError):
     pass
 
+def refuse_redirect(response: requests.Response) -> None:
+    # Every request goes out with allow_redirects=False: on a redirect to another host requests
+    # drops only the Authorization header — X-Auth-Token and Device-Id would go along, and a
+    # 307/308 would re-post the sign-in form with the password. A redirect is an HTTP error here.
+    if 300 <= response.status_code < 400:
+        raise HTTPError(
+            f"{response.status_code} redirect to {response.headers.get('Location')!r} refused",
+            response=response,
+        )
+
+
 class ManyRequestsError(HTTPError):
     pass
 
@@ -314,6 +325,11 @@ class Haier(object):
         self._session_dropped = False
         # Serializes heartbeat() runs (the interval timer does not wait for the previous run).
         self._heartbeat_lock = threading.Lock()
+        # Active washing machine polling (poll_active_laundry): one run at a time, and the pause
+        # after failed reads (consecutive failures, monotonic time before which it does not poll).
+        self._laundry_poll_lock = threading.Lock()
+        self._laundry_poll_failures = 0
+        self._laundry_poll_retry_at = 0.0
         # Serializes logins/refreshes; self._lock only guards the quick state checks, so a
         # login waiting on the rate limiter no longer blocks invalidate_token() (WS thread).
         self._auth_lock = threading.Lock()
@@ -383,9 +399,13 @@ class Haier(object):
             _LOGGER.error(f"Failed to load tokens file: {e}")
 
     def save_tokens(self) -> None:
+        filename = self._tokens_file
+        temp = f"{filename}.tmp"
         try:
-            filename = self._tokens_file
-            with open(filename, "w") as f:
+            # Readable by the owner only (the tokens give access to the account), and written
+            # aside then swapped in: a crash or a full disk mid-write leaves the old file whole.
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump({
                     "email": self.email,
                     "region": self.region,
@@ -394,8 +414,14 @@ class Haier(object):
                     "refreshtoken": self.refreshtoken,
                     "refreshexpire": str(self.refreshexpire) if self.refreshexpire else None,
                 }, f)
+            os.chmod(temp, 0o600)  # a leftover temp file may have been created with other rights
+            os.replace(temp, filename)
         except Exception as e:
             _LOGGER.error(f"Failed to save tokens file: {e}")
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
         else:
             _LOGGER.debug(f"Saved tokens file: {filename}")
 
@@ -490,11 +516,12 @@ class Haier(object):
             headers.setdefault('User-Agent', "evo-mobile")
             headers.setdefault('Platform', "android")
             headers.setdefault('Accept', "*/*")
-            resp = requests.request(method, url, **kwargs)
+            resp = requests.request(method, url, allow_redirects=False, **kwargs)
             # _LOGGER.debug(resp.text)
             # Handling 429 Too Many Requests with retry
             if resp.status_code == 429:
                 raise ManyRequestsError("429 Too Many Requests", response=resp)
+            refuse_redirect(resp)
             # Raise for other HTTP errors
             resp.raise_for_status()
             return resp
@@ -683,7 +710,7 @@ class Haier(object):
                 'Platform': 'android',
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
-            }, timeout=C.API_TIMEOUT)
+            }, timeout=C.API_TIMEOUT, allow_redirects=False)
             if attempt == 1 and response.status_code == 401 and self._non_token_401.get(path, 0) < time.monotonic():
                 if self.invalidate_token(token, f"HTTP 401 from {path}"):
                     replaced = token
@@ -702,6 +729,7 @@ class Haier(object):
                     # session may stay open without being served (commands sent into it go
                     # unanswered) — reopen it; the reconnect uses the new token.
                     self.restart_session(self._connected_at, "its access token was rejected (HTTP 401)")
+            refuse_redirect(response)
             response.raise_for_status()
             return response
 
@@ -862,12 +890,29 @@ class Haier(object):
                 device.reset_session_state()
                 device.init_if_needed()
 
+    @staticmethod
+    def _device_entities(device: HaierDevice, platform: str) -> list:
+        # The entities of one device on one platform; an error in that device's code costs only
+        # its own entities there, not the platform (and the entities of every other device).
+        try:
+            return getattr(device, f"create_entities_{platform}")()
+        except Exception:
+            _LOGGER.exception(f"Failed to create the {platform} entities of {device.device_name}")
+            return []
+
+    def platform_entities(self, platform: str) -> list:
+        # For the platforms' async_setup_entry.
+        entities = []
+        for device in list(self.devices):
+            entities.extend(self._device_entities(device, platform))
+        return entities
+
     def _async_add_device_entities(self, device: HaierDevice) -> None:
         # Runs in the event loop.
         if self.disconnect_requested:
             return
         for platform, async_add_entities in self._platform_add_entities.items():
-            if entities := getattr(device, f"create_entities_{platform}")():
+            if entities := self._device_entities(device, platform):
                 async_add_entities(entities)
 
     def refresh_devices(self, force: bool = False) -> None:
@@ -924,15 +969,29 @@ class Haier(object):
             self._silent_sessions = 0
             _LOGGER.info("The Haier cloud sends over the websocket again")
         _LOGGER.debug(f"Received WSS message: {message}")
-        message_dict: dict = json.loads(message)
+        try:
+            message_dict = json.loads(message)
+        except ValueError:
+            _LOGGER.warning(f"Got a websocket message that is not JSON: {str(message)[:200]!r}")
+            return
+        if not isinstance(message_dict, dict):
+            _LOGGER.warning(f"Got a websocket message of an unexpected shape: {str(message)[:200]!r}")
+            return
+        if message_dict.get("macAddress") in (None, ""):
+            _LOGGER.debug(f"Websocket message without a device: {message_dict.get('event')!r}")
+            return
         message_device = str(message_dict.get("macAddress")).lower()
         device = self.get_device_by_id(message_device)
         if device is None:
             if any(p["spec"]["device_mac"].lower() == message_device for p in self._pending_devices):
                 return  # failed to load at setup; heartbeat() retries it
             _LOGGER.error(f"Got a message for a device we don't know about: {message_device}")
-        else:
+            return
+        try:
             device.on_message(message_dict)
+        except Exception:
+            # One odd message must not cost the others their handling.
+            _LOGGER.exception(f"Failed to handle the {message_dict.get('event')!r} message for {device.device_name}")
 
     # noinspection PyMethodMayBeStatic,PyUnusedLocal
     def _on_open(self, ws: WebSocket) -> None:
@@ -945,9 +1004,13 @@ class Haier(object):
         self.socket_status = SocketStatus.INITIALIZED
         self._connected_at = session = time.monotonic()
         _LOGGER.debug("Websocket opened")
-        for device in self.devices:
-            device.reset_session_state()
-            device.init_if_needed()
+        for device in list(self.devices):
+            try:
+                device.reset_session_state()
+                device.init_if_needed()
+            except Exception:
+                # Must not skip the other devices nor the silent-session check below.
+                _LOGGER.exception(f"Failed to prepare {device.device_name} for the new websocket session")
         timer = threading.Timer(C.WS_SILENT_SESSION_TIMEOUT, self._check_silent_session, args=(session,))
         timer.daemon = True
         timer.start()
@@ -1204,6 +1267,46 @@ class Haier(object):
         except Exception as e:
             _LOGGER.warning(f"heartbeat refresh failed: {e}")
 
+    def wants_laundry_poll(self) -> bool:
+        # Cheap check for the event loop (see __init__.async_setup_entry): is a washing machine
+        # due for a REST read? Keeps the executor out of it while every machine is off.
+        now = time.monotonic()
+        if self.disconnect_requested or now < self._laundry_poll_retry_at:
+            return False
+        return any(isinstance(d, HaierWM) and d.needs_poll(now) for d in list(self.devices))
+
+    def poll_active_laundry(self) -> None:
+        # Runs off the event loop every WM_ACTIVE_POLL_TICK seconds while wants_laundry_poll():
+        # re-reads over REST the washing machines that are on and have had no news of the cycle
+        # for WM_ACTIVE_POLL_INTERVAL seconds (see HaierWM.needs_poll).
+        if not self._laundry_poll_lock.acquire(blocking=False):
+            return  # the previous read is still running (REST timeout, slow cloud)
+        try:
+            for device in list(self.devices):
+                now = time.monotonic()
+                if self.disconnect_requested or now < self._laundry_poll_retry_at:
+                    return
+                if not (isinstance(device, HaierWM) and device.needs_poll(now)):
+                    continue
+                try:
+                    device.poll()
+                except Exception as e:
+                    self._laundry_poll_failures += 1
+                    delay = min(
+                        C.WM_ACTIVE_POLL_INTERVAL * 2 ** self._laundry_poll_failures,
+                        C.WM_ACTIVE_POLL_BACKOFF_MAX,
+                    )
+                    self._laundry_poll_retry_at = time.monotonic() + delay
+                    # A long cloud outage is reported once, not on every attempt.
+                    log = _LOGGER.warning if self._laundry_poll_failures == 1 else _LOGGER.debug
+                    log(f"Failed to read the state of {device.device_name} ({e}), next attempt in {delay:.0f}s")
+                    return
+                if self._laundry_poll_failures:
+                    _LOGGER.info(f"The state of {device.device_name} is read again")
+                self._laundry_poll_failures = 0
+        finally:
+            self._laundry_poll_lock.release()
+
     @connect_limits.sleep_and_retry
     @connect_limits
     def run_forever(self) -> None:
@@ -1337,6 +1440,13 @@ class HaierDevice(object):
         self._cmd_lock = threading.RLock()
         # Last known raw values (normalised) per attribute code, for the API modifiers.
         self._raw: dict[str, str] = {}
+        # Monotonic time of the last WS status update per attribute code, and the start of the
+        # REST read being applied (refresh): a read that was requested before a push carries the
+        # older value and must not revert it (see _stale_codes). Guarded by self._lock.
+        self._pushed_at: dict[str, float] = {}
+        self._read_started: float | None = None
+        # The device's link to the cloud from deviceConnectionStatusEvent (GOOD / BAD / LOST).
+        self.link_status: str | None = None
 
     def __repr__(self) -> str:
         return (
@@ -1444,15 +1554,25 @@ class HaierDevice(object):
 
     def _stale_codes(self, config) -> set[str]:
         # REST values go through the same guard as WS updates: a refresh (heartbeat, GET,
-        # snapshot fallback) must not revert a command still in flight. A value that confirms
-        # the command clears the guard, as on WS.
+        # snapshot fallback, washing machine polling) must not revert a command still in flight.
+        # A value that confirms the command clears the guard, as on WS. Nor may it revert a value
+        # pushed over WS after the read was requested (e.g. a mode changed with the remote): the
+        # answer was put together before that push.
         skip, seen = set(), set()
+        read_started = self._read_started
         for attr in config.attrs:
             code = str(attr.code)
             if code in seen or attr.current is None:
                 continue
             seen.add(code)
-            if self._should_suppress_stale(code, attr.current):
+            pushed_at = self._pushed_at.get(code)
+            if read_started is not None and pushed_at is not None and pushed_at >= read_started:
+                _LOGGER.debug(
+                    f"{self.device_name}: REST value {code}={attr.current!r} is older than the "
+                    f"last WS update, kept the pushed one"
+                )
+                skip.add(code)
+            elif self._should_suppress_stale(code, attr.current):
                 skip.add(code)
         return skip
 
@@ -1460,12 +1580,17 @@ class HaierDevice(object):
         # Re-fetch the device's fresh state over REST and re-parse it.
         # The network call stays outside the lock; only the config rebuild is guarded
         # so a concurrent WS status update cannot read a half-rebuilt config.
+        started = time.monotonic()
         data = self._haier.pull_device_data(self.device_id)
         if not self.valid_status(data):
             # e.g. an error body with HTTP 200: rebuilding from it would empty the config.
             raise ValueError(f"unexpected device config payload: {str(data)[:200]}")
         with self._lock:
-            self._get_status(data)
+            self._read_started = started
+            try:
+                self._get_status(data)
+            finally:
+                self._read_started = None
         self.write_ha_state()
 
     @staticmethod
@@ -1501,9 +1626,20 @@ class HaierDevice(object):
     def _set_attribute_value(self, code: str, value: str) -> None:
         pass
 
+    @staticmethod
+    def _status_properties(received_message: dict) -> dict:
+        # The properties of every entry of payload.statuses (usually one); anything malformed
+        # (a null payload, a non-dict entry) is skipped instead of breaking the update.
+        payload = received_message.get("payload")
+        statuses = payload.get("statuses") if isinstance(payload, dict) else None
+        properties = {}
+        for status in statuses if isinstance(statuses, list) else []:
+            if isinstance(status, dict) and isinstance(status.get("properties"), dict):
+                properties.update(status["properties"])
+        return properties
+
     def _handle_status_update(self, received_message: dict) -> None:
-        statuses = received_message.get("payload", {}).get("statuses") or [{}]
-        properties = (statuses[0] or {}).get("properties") or {}
+        properties = self._status_properties(received_message)
         if len(properties) >= C.WS_FULL_SNAPSHOT_MIN_PROPS:
             self._snapshot_seen = True
         # Visible at INFO so it is clear whether realtime updates actually arrive and which
@@ -1511,7 +1647,9 @@ class HaierDevice(object):
         _LOGGER.info(f"WS status update for {self.device_name}: {properties}")
         self._log_state_correlation(properties)
         with self._lock:
+            now = time.monotonic()
             for key, value in properties.items():
+                self._pushed_at[str(key)] = now
                 # A status snapshot that arrives right after (re)connect still carries the
                 # PRE-command state and would revert the optimistic value in the UI while
                 # the command is still in flight. Skip values that contradict a recently
@@ -1523,13 +1661,17 @@ class HaierDevice(object):
         self.write_ha_state()
 
     def _handle_device_status_update(self, received_message: dict) -> None:
-        status = received_message.get("payload", {}).get("status")
+        payload = received_message.get("payload")
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status is None:
+            return  # nothing said about the device: do not mark it ONLINE
         self.available = status
         self.write_ha_state()
 
     def _handle_info(self, received_message: dict) -> None:
-        payload = received_message.get("payload", {})
-        self.sw_version = payload.get("swVersion") or self.sw_version
+        payload = received_message.get("payload")
+        if isinstance(payload, dict):
+            self.sw_version = payload.get("swVersion") or self.sw_version
 
     def _send_message(self, message: dict) -> bool:
         return self._haier.send_message(json.dumps(message)) is not False
@@ -1688,6 +1830,17 @@ class HaierDevice(object):
         else:
             problem = "it could not be sent"
         offline = "" if self._available else "the cloud reports the device OFFLINE"
+        if entry["attempt"] == 1 and entry["sent"] and not self._resend_allowed(entry["commands"]):
+            _LOGGER.warning(
+                f"CMD NO ACK [{self.device_name}] trace={trace} cmds={cmds}: {problem}"
+                f"{f' ({offline})' if offline else ''} — not resent automatically (it may have "
+                f"arrived: a second program start must not follow), showing the real state"
+            )
+            haier.restart_session(entry["session"], f"a command to {self.device_name} got no answer")
+            self._drop_followup(entry)
+            self._clear_sent_by_trace(trace)
+            self._schedule_refresh_after_failure()
+            return
         if entry["attempt"] == 1:
             _LOGGER.warning(
                 f"CMD NO ACK [{self.device_name}] trace={trace} cmds={cmds}: {problem}"
@@ -1708,6 +1861,10 @@ class HaierDevice(object):
         self._drop_followup(entry)
         self._clear_sent_by_trace(trace)
         self._schedule_refresh_after_failure()
+
+    def _resend_allowed(self, commands: list[dict]) -> bool:
+        # Whether an unanswered command may be sent once more automatically.
+        return True
 
     def _resend(self, trace: str, entry: dict) -> None:
         with self._cmd_lock:
@@ -1921,8 +2078,31 @@ class HaierDevice(object):
             self._handle_info(message_dict)
         elif message_type == "deviceStatusEvent":
             self._handle_device_status_update(message_dict)
+        elif message_type == "deviceConnectionStatusEvent":
+            self._handle_connection_status(message_dict)
+        elif message_type in ("ProgramWasherBaseEvent", "ProgramDryerBaseEvent"):
+            self._handle_program_event(message_dict)
+        elif message_type == "alarms":
+            _LOGGER.info(f"{self.device_name}: alarms {message_dict.get('payload')}")
         else:
-            _LOGGER.warning(f"Got unknown message: {message_dict}")
+            _LOGGER.warning(f"Got unknown message {message_type!r} for {self.device_name}")
+            _LOGGER.debug(f"Unknown message: {message_dict}")
+
+    def _handle_connection_status(self, received_message: dict) -> None:
+        # The device's link to the cloud: GOOD, BAD (poor internet) or LOST.
+        payload = received_message.get("payload")
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status is None or status == self.link_status:
+            return
+        previous, self.link_status = self.link_status, str(status)
+        log = _LOGGER.info if self.link_status == "GOOD" else _LOGGER.warning
+        change = self.link_status if previous is None else f"{previous} -> {self.link_status}"
+        log(f"{self.device_name}: connection to the Haier cloud {change}")
+
+    def _handle_program_event(self, received_message: dict) -> None:
+        # Washing / drying program started, paused, finished or cancelled (the event carries
+        # "data", not "payload").
+        _LOGGER.info(f"{self.device_name}: program event {received_message.get('data')}")
 
     def write_ha_state(self) -> None:
         # A copy: entities (un)subscribe from the event loop while this runs in worker threads.
@@ -2273,7 +2453,7 @@ class HaierAC(HaierDevice):
         return self.config.get_values('eco_sensor')
 
     def set_temperature(self, value: float, hvac_mode: str | None = None) -> None:
-        command = [{"commandName": self.config['target_temperature'], "value": str(value)}]
+        command = [{"commandName": self.config['target_temperature'], "value": number_text(value)}]
         if hvac_mode == HVACMode.OFF:
             self.switch_off()  # the target is read-only while off (API modifiers): not sent
         elif hvac_mode:
@@ -2316,6 +2496,12 @@ class HaierAC(HaierDevice):
             follow += extra
             names.add("target_temperature")
         power = self._get_status_commands(turn_on=True)
+        if self.status == 1 and (status_code := self.config['status']):
+            # Already on: the power command alone. The cloud's power-on rule adds side commands
+            # (on AS25S2SF2FA: Стерильная очистка and Самоочистка off) that would cancel a running
+            # cleaning or a function switched on — on every mode change, as turn_on goes through
+            # here. The Evo app does not power on a running unit at all.
+            power = [c for c in power if str(c.get("commandName")) == str(status_code)] or power
         if self.status != 1 and follow:
             # While the AC is off it declares mode, temperature, fan and presets read-only (API
             # modifiers), and the Evo app turns it on with the power command alone: send that
@@ -2671,6 +2857,13 @@ class HaierWM(HaierDevice):
         # From the device's monitoringScreen: the cycle-phase attribute and its known labels.
         self._phase_attr = None
         self._phase_labels: dict[str, str] = {}
+        # Monotonic times of the last news of the cycle (a WS update of its state, phase or
+        # remaining time, or a REST read — the time it was requested) and of the last read by
+        # the active polling (see needs_poll).
+        self._cycle_seen_at = time.monotonic()  # the state below was just read over REST
+        self._polled_at = 0.0
+        # A program event or a restored link asks for a read at the next check, on or off.
+        self._poll_requested = False
         self._get_status(backend_data)
 
     @property
@@ -2705,6 +2898,79 @@ class HaierWM(HaierDevice):
         if self.remaining_hours is None and self.remaining_minutes is None:
             return self._remaining_total
         return (self.remaining_hours or 0) * 60 + (self.remaining_minutes or 0)
+
+    @property
+    def cycle_active(self) -> bool:
+        # The machine is on (models without the on/off attribute: a phase or time is reported).
+        if self.status is not None:
+            return self.status == "on"
+        return bool(self.phase) or bool(self.remaining_time)
+
+    def needs_poll(self, now: float) -> bool:
+        # A machine that is on is re-read over REST once nothing about the cycle has arrived for
+        # WM_ACTIVE_POLL_INTERVAL seconds (1 s of slack for the timer's jitter); one the cloud
+        # reports OFFLINE has nothing new to read.
+        if not self._available:
+            return False
+        if self._poll_requested:
+            return True
+        if not self.cycle_active:
+            return False
+        last = max(self._cycle_seen_at, self._polled_at)
+        return now - last >= C.WM_ACTIVE_POLL_INTERVAL - 1
+
+    def _cycle_codes(self) -> set[str]:
+        config = self._config
+        codes = set()
+        if config is not None:
+            for name in ("status", "remaining_hours", "remaining_minutes", "remaining_time"):
+                if (code := config[name]) is not None:
+                    codes.add(str(code))
+        if self._phase_attr is not None:
+            codes.add(self._phase_attr)
+        return codes
+
+    def _handle_status_update(self, received_message: dict) -> None:
+        super()._handle_status_update(received_message)
+        properties = self._status_properties(received_message)
+        if self._cycle_codes() & {str(code) for code in properties}:
+            self._cycle_seen_at = time.monotonic()
+
+    def refresh(self) -> None:
+        requested_at = time.monotonic()
+        super().refresh()
+        self._cycle_seen_at = max(self._cycle_seen_at, requested_at)
+
+    def _resend_allowed(self, commands: list[dict]) -> bool:
+        # A program command (it carries the program codes) is not resent after a lost answer: it
+        # may have reached the machine, and the user can repeat it after seeing the real state.
+        return not any(str(c.get("commandName")) in C.WM_PROGRAM_ID_ATTRS for c in commands)
+
+    def _handle_program_event(self, received_message: dict) -> None:
+        # The program started, paused, finished or was cancelled: the event itself says little
+        # (and its shape is not documented), so the state is re-read over REST right away.
+        super()._handle_program_event(received_message)
+        self._poll_requested = True
+
+    def _handle_connection_status(self, received_message: dict) -> None:
+        # Back on the network after a loss: what the machine did meanwhile was not pushed.
+        previous = self.link_status
+        super()._handle_connection_status(received_message)
+        if self.link_status == "GOOD" and previous not in (None, "GOOD"):
+            self._poll_requested = True
+
+    def poll(self) -> None:
+        # One read of the active polling (Haier.poll_active_laundry).
+        self._polled_at = time.monotonic()
+        self._poll_requested = False
+        before = (self.status, self.program, self.phase, self.remaining_time)
+        self.refresh()
+        after = (self.status, self.program, self.phase, self.remaining_time)
+        if after != before:
+            _LOGGER.debug(
+                f"{self.device_name}: read over REST: status={after[0]}, program={after[1]}, "
+                f"phase={after[2]}, remaining={after[3]} min"
+            )
 
     def to_dict(self) -> dict:
         data = super().to_dict()
@@ -2826,20 +3092,37 @@ class HaierWM(HaierDevice):
         self._rest_program = (control.get("currentProgram") or {}).get("title") or None
 
     def _parse_monitoring(self, data: dict) -> None:
-        # monitoringScreen names the cycle-phase attribute and labels a few of its values
-        # (weighing, finishing, fresh air); the other phases are shown by number.
-        screen = (data or {}).get("monitoringScreen") or {}
-        phase = (screen.get("phase") or {}).get("name")
-        self._phase_attr = str(phase) if phase not in (None, "") else None
+        # monitoringScreen names the cycle-phase attribute and titles its values. It sits at the
+        # top of the description, in allProgram (washers) or in device (dryers). The titles come
+        # from phase.cyclePhaseValueToTitle and from the weighing / finishing / fresh-air blocks;
+        # phases without a title are shown by number.
+        data = data if isinstance(data, dict) else {}
+        screen = {}
+        for parent in (data, data.get("allProgram"), data.get("device")):
+            candidate = parent.get("monitoringScreen") if isinstance(parent, dict) else None
+            if isinstance(candidate, dict):
+                screen = candidate
+                break
+        phase = screen.get("phase") if isinstance(screen.get("phase"), dict) else {}
+        name = phase.get("name")
+        self._phase_attr = str(name) if name not in (None, "") else None
         labels = {}
+        titles = phase.get("cyclePhaseValueToTitle")
+        if isinstance(titles, dict):
+            for value, title in titles.items():
+                if isinstance(title, str) and title.strip():
+                    labels[self._code(value)] = title.strip()
         for block, key in (
             ("weighing", "weightAttrValue"),
             ("finishing", "finishingAttrValue"),
+            ("finishing", "cyclePhaseValue"),
             ("freshAirSystem", "freshAirSystemAttrValue"),
         ):
-            part = screen.get(block) or {}
-            if part.get(key) not in (None, "") and part.get("title"):
-                labels[self._code(part[key])] = part["title"]
+            for parent in (screen, phase):
+                part = parent.get(block)
+                if (isinstance(part, dict) and part.get(key) not in (None, "")
+                        and isinstance(part.get("title"), str) and part["title"].strip()):
+                    labels.setdefault(self._code(part[key]), part["title"].strip())
         self._phase_labels = labels
 
     def _complete_options(self, config: CFG.HaierWMConfig) -> None:
@@ -2997,6 +3280,15 @@ def parseint(value) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def number_text(value) -> str:
+    # "23", not "23.0" (HA passes the setpoint as a float): the cloud keeps it as an integer, as
+    # the Evo app sends it. A fractional value stays as it is.
+    number = parsefloat(value)
+    if number is not None and number.is_integer():
+        return str(int(number))
+    return str(value)
 
 
 def parsefloat(value) -> float | None:

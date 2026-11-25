@@ -38,6 +38,16 @@ def _as_number(value) -> float | None:
         return None
 
 
+def _dict(value) -> dict:
+    # A part of the cloud's description of an unexpected type counts as missing: one odd rule
+    # must not break the climate entity and every command (modifiers are read on each of them).
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
 def _yaml_text(value, true: str, false: str) -> str | None:
     # Unquoted on/off/yes/no are booleans in YAML 1.1: read them the way they were meant.
     if value is True:
@@ -655,10 +665,10 @@ class Modifier(dict):
         return str(int(number)) if number.is_integer() else text
 
     def conditions(self) -> list[tuple[str, set[str]]]:
-        trigger = self.get("trigger") or {}
-        items = (trigger.get("conditions") or {}).get("condition") or []
+        trigger = _dict(self.get("trigger"))
+        items = _list(_dict(trigger.get("conditions")).get("condition"))
         return [
-            (str(c["mode"]), {self.norm(v) for v in (c.get("values") or [])})
+            (str(c["mode"]), {self.norm(v) for v in _list(c.get("values"))})
             for c in items if isinstance(c, dict) and c.get("mode") is not None
         ]
 
@@ -667,12 +677,12 @@ class Modifier(dict):
         if not conditions:
             return False
         hits = [state.get(code) in values for code, values in conditions]
-        operator = str((self.get("trigger") or {}).get("operator") or "AND").upper()
+        operator = str(_dict(self.get("trigger")).get("operator") or "AND").upper()
         return any(hits) if operator == "OR" else all(hits)
 
     def _actions(self, kind: str) -> list[dict]:
         return [
-            a for a in (self.get("actions") or [])
+            a for a in _list(self.get("actions"))
             if isinstance(a, dict) and a.get("name") is not None
             and str(a.get("rewriteFields", "")).upper() == kind
         ]
@@ -683,7 +693,7 @@ class Modifier(dict):
     def ranges(self) -> dict[str, set[str]]:
         ranges = {}
         for a in self._actions("V"):
-            data = (((a.get("valueRange") or {}).get("list") or {}).get("data")) or []
+            data = _list(_dict(_dict(a.get("valueRange")).get("list")).get("data"))
             values = {self.norm(i["data"]) for i in data if isinstance(i, dict) and i.get("data") is not None}
             if values:
                 ranges[str(a["name"])] = values

@@ -7,9 +7,7 @@ from . import api
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
     haier_object = config_entry.runtime_data
     haier_object.register_platform("binary_sensor", async_add_entities)
-    entities = []
-    for device in haier_object.devices:
-        entities.extend(device.create_entities_binary_sensor())
+    entities = haier_object.platform_entities("binary_sensor")
     if entities:
         async_add_entities(entities)
         haier_object.write_ha_state()

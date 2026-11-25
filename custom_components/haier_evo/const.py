@@ -103,6 +103,15 @@ TOKEN_REJECT_MIN_AGE = 60
 WM_PROGRAM_ID_ATTRS = ("90", "0")
 WM_PROGRAM_ATTR = "0"
 WM_SUBPROGRAM_ATTR = "90"
+# The cloud pushes little of a wash over the websocket: the phase and the remaining time reached HA
+# only every ~3 min (and the heartbeat re-reads REST every 5 min). While a washing machine is on,
+# its state is re-read over REST once nothing about the cycle (state, phase, remaining time) has
+# arrived for WM_ACTIVE_POLL_INTERVAL seconds — a push in between makes the read unnecessary. The
+# check runs every WM_ACTIVE_POLL_TICK seconds, so the data is at most about INTERVAL + TICK old.
+# A failed read (429, 5xx, network) pauses the polling, doubling up to WM_ACTIVE_POLL_BACKOFF_MAX.
+WM_ACTIVE_POLL_INTERVAL = 15
+WM_ACTIVE_POLL_TICK = 5
+WM_ACTIVE_POLL_BACKOFF_MAX = 300
 # Minimum interval (sec) between data refreshes triggered by GET /api/haier_evo requests.
 # Protects against a flood of REST requests to Haier when the endpoint is polled often. 0 — refresh every time.
 API_REFRESH_TTL = 5

@@ -65,9 +65,11 @@ def sign_in(email: str, password: str, region: str) -> None:
             data={"email": email, "password": password},
             headers={"User-Agent": "evo-mobile", "Platform": "android", "Accept": "*/*"},
             timeout=C.API_TIMEOUT,
+            allow_redirects=False,  # a redirect would re-post the password elsewhere
         )
         if response.status_code == 429:
             raise CannotConnect("429 Too Many Requests")
+        api.refuse_redirect(response)
         response.raise_for_status()
         auth = api.AuthResponse(response)
         auth.raise_for_error()
