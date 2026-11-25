@@ -45,12 +45,12 @@ class HaierSelect(SelectEntity):
         return value if value in (self._attr_options or []) else None
 
     async def async_select_option(self, option: str) -> None:
-        await self.hass.async_add_executor_job(self.set_option, option)
+        await self.set_option(option)
 
-    def set_option(self, value) -> None:
+    async def set_option(self, value) -> None:
         method = getattr(self._device, f"set_{self._device_attr_name}", None)
         if method is not None:
-            method(value)
+            await method(value)
 
 
 class HaierACEcoSensorSelect(HaierSelect):
@@ -119,10 +119,10 @@ class HaierWMProgramSelect(HaierWMSelect):
         value = getattr(self._device, self._device_attr_name, None)
         return value if value in self._attr_options else self.PLACEHOLDER
 
-    def set_option(self, value) -> None:
+    async def set_option(self, value) -> None:
         if value == self.PLACEHOLDER:
             return
-        super().set_option(value)
+        await super().set_option(value)
 
 
 class HaierWMTemperatureSelect(HaierWMSelect):

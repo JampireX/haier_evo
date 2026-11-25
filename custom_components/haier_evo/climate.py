@@ -119,43 +119,40 @@ class HaierACEntity(ClimateEntity):
     async def async_set_temperature(self, **kwargs) -> None:
         """Set new target temperature (and the mode, if the service call names one)."""
         temp = kwargs.get("temperature", self.target_temperature)
-        await self.hass.async_add_executor_job(self.set_temperature, temp, kwargs.get("hvac_mode"))
-
-    def set_temperature(self, temp: float, hvac_mode: str | None = None) -> None:
-        """Set new target temperature."""
+        hvac_mode = kwargs.get("hvac_mode")
         _LOGGER.debug(f"Setting target temperature to {temp} (hvac_mode={hvac_mode})")
-        self._device.set_temperature(temp, hvac_mode)
+        await self._device.set_temperature(temp, hvac_mode)
 
-    def set_hvac_mode(self, hvac_mode: str) -> None:
+    async def async_set_hvac_mode(self, hvac_mode: str) -> None:
         """Set new target hvac mode."""
         _LOGGER.debug(f"Setting HVAC mode to {hvac_mode}")
         if hvac_mode == HVACMode.OFF:
-            self._device.switch_off()
+            await self._device.switch_off()
         else:
-            self._device.switch_on(hvac_mode)
+            await self._device.switch_on(hvac_mode)
 
-    def set_fan_mode(self, fan_mode: str) -> None:
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode."""
         _LOGGER.debug(f"Setting fan mode to {fan_mode}")
-        self._device.set_fan_mode(fan_mode)
+        await self._device.set_fan_mode(fan_mode)
 
-    def set_swing_horizontal_mode(self, swing_mode: str) -> None:
+    async def async_set_swing_horizontal_mode(self, swing_horizontal_mode: str) -> None:
         """Set new target swing horizontal mode."""
-        _LOGGER.debug(f"Setting swing horizontal mode to {swing_mode}")
-        self._device.set_swing_horizontal_mode(swing_mode)
+        _LOGGER.debug(f"Setting swing horizontal mode to {swing_horizontal_mode}")
+        await self._device.set_swing_horizontal_mode(swing_horizontal_mode)
 
-    def set_swing_mode(self, swing_mode: str) -> None:
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Set new target swing operation."""
         _LOGGER.debug(f"Setting swing mode to {swing_mode}")
-        self._device.set_swing_mode(swing_mode)
+        await self._device.set_swing_mode(swing_mode)
 
-    def set_preset_mode(self, preset_mode: str) -> None:
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
         _LOGGER.debug(f"Setting preset mode to {preset_mode}")
-        self._device.set_preset_mode(preset_mode)
+        await self._device.set_preset_mode(preset_mode)
 
-    def turn_on(self) -> None:
-        self._device.switch_on()
+    async def async_turn_on(self) -> None:
+        await self._device.switch_on()
 
-    def turn_off(self) -> None:
-        self._device.switch_off()
+    async def async_turn_off(self) -> None:
+        await self._device.switch_off()

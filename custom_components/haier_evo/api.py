@@ -1,26 +1,22 @@
 from __future__ import annotations
-import requests
+import asyncio
 import json
-import logging
 import os
 import re
 import time
-import threading
 import uuid
-import socket
-import ssl
 import weakref
-from collections.abc import Callable
-from aiohttp import web
+from collections.abc import Callable, Coroutine
+from contextlib import suppress
 from enum import Enum
 from datetime import datetime, timezone, timedelta
-from tenacity import retry, stop_after_attempt, retry_if_exception_type, wait_fixed
-from websocket import WebSocketApp, WebSocket, WebSocketException, WebSocketConnectionClosedException
-from requests.exceptions import ConnectionError, Timeout, HTTPError
+from typing import Any
 from urllib.parse import urlparse, urljoin, parse_qs
-from urllib3.exceptions import NewConnectionError
+from aiohttp import ClientError, ClientTimeout, ClientWebSocketResponse, WSMsgType, WSServerHandshakeError, web
+from aiohttp.client_ws import ClientWSTimeout
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACMode, SWING_OFF, PRESET_NONE
 from homeassistant.components.http import HomeAssistantView
@@ -39,10 +35,24 @@ class InvalidCredentials(InvalidAuth):
 class InvalidDevicesList(HomeAssistantError):
     """Error to indicate we cannot connect."""
 
-class AuthError(HTTPError):
+
+class HaierHTTPError(Exception):
+    """The cloud answered with an HTTP error (4xx / 5xx, a refused redirect)."""
+
+    def __init__(self, *args, response: _Response | AuthResponse | None = None, status: int | None = None) -> None:
+        super().__init__(*args)
+        self.response = response
+        self.status = status if status is not None else getattr(response, "status_code", None)
+
+
+class HaierConnectionError(Exception):
+    """No answer: network error, timeout, an answer that is not JSON."""
+
+
+class AuthError(HaierHTTPError):
     pass
 
-class AuthUserError(HTTPError):
+class AuthUserError(HaierHTTPError):
     pass
 
 class AuthValidationError(AuthError):
@@ -51,15 +61,49 @@ class AuthValidationError(AuthError):
 class AuthInternalError(AuthError):
     pass
 
-def refuse_redirect(response: requests.Response) -> None:
-    # Every request goes out with allow_redirects=False: on a redirect to another host requests
-    # drops only the Authorization header — X-Auth-Token and Device-Id would go along, and a
-    # 307/308 would re-post the sign-in form with the password. A redirect is an HTTP error here.
+
+class _Response:
+    """An answer of the cloud, read whole (what the integration needs of requests.Response)."""
+
+    def __init__(self, status: int, headers, body: bytes, url: str) -> None:
+        self.status_code = status
+        self.headers = headers
+        self.body = body
+        self.url = url
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+    def json(self) -> Any:
+        try:
+            return json.loads(self.body.decode("utf-8") if self.body else "null")
+        except (ValueError, UnicodeDecodeError):
+            raise HaierConnectionError(
+                f"HTTP {self.status_code} from {urlparse(self.url).path}: the answer is not JSON"
+            ) from None
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise HaierHTTPError(f"{self.status_code} error for {urlparse(self.url).path}", response=self)
+
+    def __repr__(self) -> str:
+        return f"<Response [{self.status_code}]>"
+
+
+def refuse_redirect(response: _Response) -> None:
+    # Every request goes out with allow_redirects=False: a redirect could take X-Auth-Token and
+    # Device-Id elsewhere, and a 307/308 would re-post the sign-in form with the password. A
+    # redirect is an HTTP error here.
     if 300 <= response.status_code < 400:
-        raise HTTPError(
+        raise HaierHTTPError(
             f"{response.status_code} redirect to {response.headers.get('Location')!r} refused",
             response=response,
         )
+
+
+# REST requests: requests' timeout=15 of the threaded versions (connect and each read).
+_HTTP_TIMEOUT = ClientTimeout(total=None, sock_connect=C.API_TIMEOUT, sock_read=C.API_TIMEOUT)
 
 
 # A device id of the device list: a MAC address (UUID ids are appliances without Wi-Fi).
@@ -137,7 +181,7 @@ def firmware_text(value) -> str | None:
     return None
 
 
-class ManyRequestsError(HTTPError):
+class ManyRequestsError(HaierHTTPError):
     pass
 
 
@@ -159,9 +203,7 @@ class HaierAPI(HomeAssistantView):
         self.instances: weakref.WeakValueDictionary[str, Haier] = weakref.WeakValueDictionary()
 
     def _allowed(self, flag: str) -> list:
-        with Haier.registry_lock:
-            instances = list(self.instances.values())
-        return [h for h in instances if getattr(h, flag, False)]
+        return [h for h in list(self.instances.values()) if getattr(h, flag, False)]
 
     # noinspection PyUnusedLocal
     async def get(self, request):
@@ -169,9 +211,9 @@ class HaierAPI(HomeAssistantView):
         if not clients:
             return web.Response(text="404: Not found", status=404, content_type="text/plain")
         for client in clients:
-            # re-fetch fresh data from the devices (in an executor so the loop is not blocked)
+            # re-fetch fresh data from the devices (rate-limited by API_REFRESH_TTL)
             try:
-                await client.hass.async_add_executor_job(client.refresh_devices)
+                await client.async_refresh_devices()
             except Exception as e:
                 _LOGGER.warning(f"Failed to refresh devices on GET: {e}")
         if len(clients) == 1:
@@ -188,13 +230,13 @@ class HaierAPI(HomeAssistantView):
             client = clients[0]
         if client is None:
             return web.Response(text="404: Not found", status=404, content_type="text/plain")
-        sent = await client.hass.async_add_executor_job(client.send_message, json.dumps(data))
+        sent = await client.async_send_message(json.dumps(data))
         return self.json({"result": "success" if sent else "not sent"})
 
 
 class AuthResponse(object):
 
-    def __init__(self, response: requests.Response):
+    def __init__(self, response: _Response):
         self.response = response
         self.json_data = response.json() or {}
         self.data = self.json_data.get("data") or {}
@@ -275,65 +317,12 @@ def parse_expire(value) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=_MSK)
 
 
-class _TimeoutSSLContext(ssl.SSLContext):
-    # websocket-client opens the websocket without a socket timeout, so a TLS handshake or an
-    # HTTP upgrade the server never answers blocks run_forever() forever. The context it is
-    # given (sslopt) wraps the TCP socket right before the TLS handshake: the timeout is set there.
-    timeout: float | None = None
-
-    def wrap_socket(self, sock, *args, **kwargs):
-        sock.settimeout(self.timeout)
-        return super().wrap_socket(sock, *args, **kwargs)
-
-
-def _ws_ssl_context(timeout: float) -> ssl.SSLContext:
-    # What websocket-client sets up itself when no context is given: certificate and host name
-    # checks, the system CA certificates or the bundle named by WEBSOCKET_CLIENT_CA_BUNDLE.
-    context = _TimeoutSSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.timeout = timeout
-    bundle = os.environ.get("WEBSOCKET_CLIENT_CA_BUNDLE")
-    if bundle and os.path.isfile(bundle):
-        context.load_verify_locations(cafile=bundle)
-    elif bundle and os.path.isdir(bundle):
-        context.load_verify_locations(capath=bundle)
-    else:
-        context.load_default_certs(ssl.Purpose.SERVER_AUTH)
-    return context
-
-
-def _ws_sockopt() -> tuple:
-    # The TCP connect has no timeout in websocket-client either (only a process-wide default,
-    # which would change every other integration's websockets): an unanswered SYN waited for
-    # the kernel to give up, about 2 min. TCP_SYNCNT caps the SYN retransmissions instead.
-    syncnt = getattr(socket, "TCP_SYNCNT", None)  # Linux only
-    if syncnt is None:
-        return ()
-    return ((socket.IPPROTO_TCP, syncnt, C.WS_CONNECT_SYN_RETRIES),)
-
-
-def _log_send_message_failure(retry_state):
-    # Called by tenacity once send_message has exhausted every attempt (the device's ACK
-    # watchdog still resends the command once, see HaierDevice._on_ack_timeout). We always log
-    # it as an error (and dump the payload + last exception) so a dropped command — in
-    # particular the first one after an idle period — is never silently swallowed.
-    payload = retry_state.args[1] if len(retry_state.args) > 1 else "<unknown>"
-    outcome = retry_state.outcome
-    exc = outcome.exception() if outcome is not None else None
-    _LOGGER.error(
-        f"Command NOT sent after {retry_state.attempt_number} attempt(s). "
-        f"Last error: {exc!r}. Payload: {payload}"
-    )
-    return False
-
-
 class Haier(object):
 
     http = HaierAPI()
-    # Running instances (one per config entry) — see _reset_limits_if_alone. _live and the debug
-    # view's instances are used from the event loop and from worker threads (stop() runs in the
-    # executor): registry_lock guards both.
+    # Running instances (one per config entry) — see _reset_limits_if_alone. Everything runs in
+    # the event loop: no locks around them.
     _live: weakref.WeakSet = weakref.WeakSet()
-    registry_lock = threading.Lock()
     connect_limits = ResettableLimits(calls=1, period=5)
     common_limits = ResettableLimits(
         calls=C.COMMON_LIMIT_CALLS,
@@ -359,10 +348,11 @@ class Haier(object):
         http: bool = C.API_HTTP_ROUTE,
         entry_id: str = "default",
     ) -> None:
-        self._lock = threading.Lock()
-        # Serializes WebSocket writes: HA executor threads and the WS thread (_on_open ->
-        # init_if_needed) can otherwise call socket_app.send() concurrently and corrupt frames.
-        self._send_lock = threading.Lock()
+        # Everything of this object runs in Home Assistant's event loop (no threads): REST and
+        # the websocket go through Home Assistant's aiohttp session.
+        self._session = async_get_clientsession(hass)
+        # Serializes websocket writes: a command waiting for a reconnect must not be overtaken.
+        self._send_lock = asyncio.Lock()
         self._pull_data = None
         self._last_refresh = None
         # Stable per entry (as and7ey/haier_evo 1.x): a new random one on every start made every
@@ -390,9 +380,7 @@ class Haier(object):
         self._token_obtained_at = None
         # Access token the current WS session was opened with (it is part of the WS URL).
         self._ws_token = None
-        # Serializes restart_session(): commands timing out together restart the session once.
-        self._restart_lock = threading.Lock()
-        # Called from a worker thread when the server rejects the email/password at runtime.
+        # Called when the server rejects the email/password at runtime (starts the reauth flow).
         self.on_auth_failed = None
         # Devices whose REST config failed during setup: heartbeat() retries them and adds
         # their entities on the fly through the platforms' async_add_entities.
@@ -401,12 +389,12 @@ class Haier(object):
         # The last device discovery found the Evo page without any device (async_setup_entry
         # retries the setup then, if the entry had devices).
         self.no_devices_listed = False
-        self.socket_app: WebSocketApp | None = None
-        # TLS options of the websocket (a context with the connect timeout), made on first use.
-        self._ws_sslopt: dict | None = None
+        # The websocket: the task running the connection loop (_async_ws_loop) and the open
+        # session (None while there is none).
+        self._ws_task: asyncio.Task | None = None
+        self._ws: ClientWebSocketResponse | None = None
         self.disconnect_requested = False
         self.socket_status: SocketStatus = SocketStatus.PRE_INITIALIZATION
-        self.socket_thread = None
         # Monotonic time the current WS session opened (for command/session diagnostics).
         self._connected_at = None
         # Monotonic time of the last inbound WS message (any device) — see _is_session_stale.
@@ -414,28 +402,31 @@ class Haier(object):
         # Consecutive sessions the cloud has sent nothing over (_check_silent_session drops
         # them); reset by the first inbound message.
         self._silent_sessions = 0
-        # True while the current session is being dropped for silence: connect() then backs off.
+        # True while the current session is being dropped for silence: the loop then backs off.
         self._session_silent = False
+        self._silent_timer: asyncio.TimerHandle | None = None
         # REST paths whose 401 turned out not to be a token problem -> monotonic expiry time.
         self._non_token_401: dict[str, float] = {}
-        # Wakes the reconnect backoff wait in connect(): set by stop(), and by a command that
+        # Wakes the reconnect backoff wait of the loop: set by stop(), and by a command that
         # needs the session (connect_if_needed), so it does not sit out the whole delay.
-        self._wake_event = threading.Event()
+        self._wake = asyncio.Event()
         # True when the current WS session was ended by us (_drop_session), not by a failure.
         self._session_dropped = False
-        # Serializes heartbeat() runs (the interval timer does not wait for the previous run).
-        self._heartbeat_lock = threading.Lock()
-        # Active washing machine polling (poll_active_laundry): one run at a time, and the pause
-        # after failed reads (consecutive failures, monotonic time before which it does not poll).
-        self._laundry_poll_lock = threading.Lock()
+        # heartbeat() and the washing machine polling: one run at a time (the timers do not
+        # wait for the previous run).
+        self._heartbeat_running = False
+        self._laundry_poll_running = False
+        # Active washing machine polling: the pause after failed reads (consecutive failures,
+        # monotonic time before which it does not poll).
         self._laundry_poll_failures = 0
         self._laundry_poll_retry_at = 0.0
-        # Serializes logins/refreshes; self._lock only guards the quick state checks, so a
-        # login waiting on the rate limiter no longer blocks invalidate_token() (WS thread).
-        self._auth_lock = threading.Lock()
+        # One login/refresh at a time; one write of the tokens file at a time.
+        self._auth_lock = asyncio.Lock()
+        self._save_lock = asyncio.Lock()
+        # Short tasks of this object (token saves, session closes): cancelled by async_stop().
+        self._tasks: set[asyncio.Task] = set()
         self._reset_limits_if_alone()
-        with Haier.registry_lock:
-            Haier._live.add(self)
+        Haier._live.add(self)
         self.register_view()
 
     def to_dict(self) -> dict:
@@ -445,6 +436,13 @@ class Haier(object):
             "devices": [device.to_dict() for device in self.devices],
             "pending_devices": [p["spec"] for p in self._pending_devices],
         }
+
+    def _create_task(self, coro: Coroutine, name: str) -> asyncio.Task:
+        # A task of this object, cancelled by async_stop() if it still runs then.
+        task = self.hass.async_create_background_task(coro, f"{C.DOMAIN} {name}", eager_start=False)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     @staticmethod
     def tokens_file(hass: HomeAssistant, entry_id: str) -> str:
@@ -463,6 +461,7 @@ class Haier(object):
         # Tokens used to live in a single <config>/haier_evo file shared by all entries. It is
         # no longer read, so drop it rather than leave a stale refresh token on disk.
         # (<config>/haier_evo.<model>.yaml device configs only share the prefix — untouched.)
+        # Blocking: runs in the executor.
         legacy = self.hass.config.path(C.DOMAIN)
         if os.path.isfile(legacy):
             try:
@@ -471,47 +470,64 @@ class Haier(object):
             except OSError as e:
                 _LOGGER.warning(f"Failed to remove legacy tokens file {legacy}: {e}")
 
-    def load_tokens(self) -> None:
+    def _read_tokens_file(self) -> dict | None:
+        # Blocking: runs in the executor. The saved tokens, or None.
         self._remove_legacy_tokens_file()
         filename = self._tokens_file
         try:
             with open(filename, "r") as f:
                 data = json.load(f)
-            assert isinstance(data, dict), "Bad saved tokens file"
-            # Tokens are bound to the account and region they were issued for, so they are
-            # not reused after the credentials were changed in the options.
-            if (
-                str(data.get("email") or "").lower() != self.email.lower()
-                or data.get("region") != self.region
-            ):
-                _LOGGER.info(f"Saved tokens belong to another account/region, ignoring: {filename}")
-                return
-            self.token = data.get("token", None)
-            self.tokenexpire = parse_expire(data.get("tokenexpire"))
-            self.refreshtoken = data.get("refreshtoken", None)
-            self.refreshexpire = parse_expire(data.get("refreshexpire"))
-            _LOGGER.info(f"Loaded tokens file: {filename}")
         except FileNotFoundError:
             _LOGGER.warning(f"No tokens file: {filename}")
+            return None
         except Exception as e:
             _LOGGER.error(f"Failed to load tokens file: {e}")
+            return None
+        if not isinstance(data, dict):
+            _LOGGER.error("Failed to load tokens file: Bad saved tokens file")
+            return None
+        return data
 
-    def save_tokens(self) -> None:
+    async def async_load_tokens(self) -> None:
+        data = await self.hass.async_add_executor_job(self._read_tokens_file)
+        if data is None:
+            return
         filename = self._tokens_file
+        # Tokens are bound to the account and region they were issued for, so they are not
+        # reused after the credentials were changed in the options.
+        if (
+            str(data.get("email") or "").lower() != self.email.lower()
+            or data.get("region") != self.region
+        ):
+            _LOGGER.info(f"Saved tokens belong to another account/region, ignoring: {filename}")
+            return
+        self.token = data.get("token", None)
+        self.tokenexpire = parse_expire(data.get("tokenexpire"))
+        self.refreshtoken = data.get("refreshtoken", None)
+        self.refreshexpire = parse_expire(data.get("refreshexpire"))
+        _LOGGER.info(f"Loaded tokens file: {filename}")
+
+    def _tokens_data(self) -> dict:
+        # The format of every version since 0.3.16: a downgrade keeps the sign-in.
+        return {
+            "email": self.email,
+            "region": self.region,
+            "token": self.token,
+            "tokenexpire": str(self.tokenexpire) if self.tokenexpire else None,
+            "refreshtoken": self.refreshtoken,
+            "refreshexpire": str(self.refreshexpire) if self.refreshexpire else None,
+        }
+
+    @staticmethod
+    def _write_tokens_file(filename: str, data: dict) -> None:
+        # Blocking: runs in the executor.
         temp = f"{filename}.tmp"
         try:
             # Readable by the owner only (the tokens give access to the account), and written
             # aside then swapped in: a crash or a full disk mid-write leaves the old file whole.
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
-                json.dump({
-                    "email": self.email,
-                    "region": self.region,
-                    "token": self.token,
-                    "tokenexpire": str(self.tokenexpire) if self.tokenexpire else None,
-                    "refreshtoken": self.refreshtoken,
-                    "refreshexpire": str(self.refreshexpire) if self.refreshexpire else None,
-                }, f)
+                json.dump(data, f)
             os.chmod(temp, 0o600)  # a leftover temp file may have been created with other rights
             os.replace(temp, filename)
         except Exception as e:
@@ -523,12 +539,23 @@ class Haier(object):
         else:
             _LOGGER.debug(f"Saved tokens file: {filename}")
 
+    async def async_save_tokens(self) -> None:
+        # One write at a time (they share the temp file); the data is taken when it is this
+        # write's turn, in the loop — the last write has the newest tokens.
+        async with self._save_lock:
+            await self.hass.async_add_executor_job(self._write_tokens_file, self._tokens_file, self._tokens_data())
+
+    def _schedule_save_tokens(self) -> None:
+        # For the places that cannot wait for the write (it must not be lost on unload, though:
+        # async_stop() waits for the writes still running).
+        self._create_task(self.async_save_tokens(), "save tokens")
+
     def clear_tokens(self) -> None:
         self.token = None
         self.tokenexpire = None
         self.refreshtoken = None
         self.refreshexpire = None
-        self.save_tokens()
+        self._schedule_save_tokens()
 
     def reset_limits(self) -> None:
         self.connect_limits.reset()
@@ -538,10 +565,9 @@ class Haier(object):
 
     def _reset_limits_if_alone(self) -> None:
         # The limiters are class-level, shared by all config entries (one source IP): a reset
-        # (also used to wake sleeping threads on stop) must not wipe the backoff another
+        # (also used to wake the calls waiting in them on stop) must not wipe the backoff another
         # running entry has built up.
-        with Haier.registry_lock:
-            others = [h for h in Haier._live if h is not self and not h.disconnect_requested]
+        others = [h for h in list(Haier._live) if h is not self and not h.disconnect_requested]
         if not others:
             self.reset_limits()
 
@@ -553,70 +579,81 @@ class Haier(object):
         return resources() if resources else []
 
     def register_view(self) -> None:
+        self.http.instances[self.entry_id] = self
+        if getattr(self.hass, "http", None) is None:
+            return  # no HTTP server (a test without the http component)
         if self.http.url not in (r.canonical for r in self.get_http_resources()):
             self.hass.http.register_view(self.http)
-        with Haier.registry_lock:
-            self.http.instances[self.entry_id] = self
 
     def unregister_view(self) -> None:
         # The debug view is shared by all config entries: detach only this one.
-        with Haier.registry_lock:
-            if self.http.instances.get(self.entry_id) is self:
-                del self.http.instances[self.entry_id]
+        if self.http.instances.get(self.entry_id) is self:
+            del self.http.instances[self.entry_id]
 
-    def stop(self) -> None:
+    async def async_stop(self) -> None:
+        # Unload: no new session, no new command; what runs is cancelled. The websocket is closed
+        # without waiting for the cloud's answer to the close frame for long (WS_CLOSE_TIMEOUT).
         self.disconnect_requested = True
-        self._wake_event.set()
+        self._wake.set()
         self._reset_limits_if_alone()
-        # Non-blocking: the WS thread tears the session down and its connect() loop exits.
-        self._drop_session()
         self.unregister_view()
+        if self._silent_timer is not None:
+            self._silent_timer.cancel()
+            self._silent_timer = None
+        for device in list(self.devices):
+            device.cancel_pending()
+        tasks = [t for t in (self._ws_task, *self._tasks) if t is not None and not t.done()]
+        # Token writes are let finish (a refresh just made must reach the file); the rest stops.
+        saving = [t for t in tasks if t.get_name().endswith("save tokens")]
+        for task in tasks:
+            if task not in saving:
+                task.cancel()
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            with suppress(Exception):
+                await ws.close()
+        if tasks:
+            # Not "await task": that would raise the tasks' errors, and suppressing CancelledError
+            # there would also swallow a cancellation of this unload itself.
+            await asyncio.wait(tasks, timeout=C.WS_CLOSE_TIMEOUT + 4)
+        self._ws = None
+        self._ws_task = None
 
     def _drop_session(self) -> bool:
-        # Makes the WS thread end the current session; its connect() loop then opens the next
-        # one (or exits after stop()). WebSocketApp.close() must not be called from another
-        # thread: in websocket-client 1.9.2 it waits up to 3 s for the close handshake and then
-        # clears app.sock unconditionally — when the WS thread has opened the next session
-        # meanwhile, that wipes the new socket and the thread spins without a connection.
-        # Instead: end the run loop, send a close frame without waiting for the answer, and
-        # shut the socket down so the WS thread wakes up and tears the session down itself.
-        app = self.socket_app
-        sock = getattr(app, "sock", None)
-        if app is None or sock is None:
+        # Ends the current session; the connection loop then opens the next one (or ends after
+        # async_stop()). The session is "not ready" at once: commands wait for the next one.
+        ws = self._ws
+        if ws is None or ws.closed:
             return False
-        app.keep_running = False
         self._session_dropped = True
-        try:
-            sock.send_close()
-        except Exception as e:
-            _LOGGER.debug(f"Error dropping the websocket session: {e!r}")
-        # Not WebSocket.abort(): it only acts on a `connected` socket, and send_close() has just
-        # cleared that flag (an attempt still waiting for the upgrade never had it). The TCP
-        # socket itself is shut down, so the read the WS thread is blocked in returns at once.
-        # socket.socket.shutdown, not SSLSocket.shutdown(): that one also drops the SSL object
-        # the WS thread may be reading through at this very moment.
-        raw = getattr(sock, "sock", None)
-        if raw is not None:
-            try:
-                socket.socket.shutdown(raw, socket.SHUT_RDWR)
-            except Exception as e:
-                _LOGGER.debug(f"Error shutting the websocket down: {e!r}")
+        self._ws = None
+        self.socket_status = SocketStatus.NOT_INITIALIZED
+        self._create_task(ws.close(), "close websocket")
         return True
 
-    @common_limits.sleep_and_retry
-    @common_limits
-    def make_request(self, method: str, url: str, **kwargs) -> requests.Response:
+    async def _http(self, method: str, url: str, headers: dict, data: dict | None = None) -> _Response:
+        # One request; the answer read whole. Network errors and timeouts: HaierConnectionError.
         try:
-            assert self.disconnect_requested is False, 'Service already stoped'
-            # Setting a default timeout for requests
-            kwargs.setdefault('timeout', C.API_TIMEOUT)
-            headers = kwargs.setdefault('headers', {})
-            headers.setdefault('User-Agent', "evo-mobile")
-            headers.setdefault('Platform', "android")
-            headers.setdefault('Accept', "*/*")
-            headers.setdefault('Device-Id', self._device_id)  # as the app: on sign-in too
-            resp = requests.request(method, url, allow_redirects=False, **kwargs)
-            # _LOGGER.debug(resp.text)
+            async with self._session.request(
+                method, url, headers=headers, data=data, timeout=_HTTP_TIMEOUT, allow_redirects=False,
+            ) as resp:
+                return _Response(resp.status, resp.headers, await resp.read(), url)
+        except asyncio.CancelledError:
+            raise
+        except (ClientError, TimeoutError, OSError) as e:
+            raise HaierConnectionError(f"{type(e).__name__}: {e}") from None
+
+    @common_limits
+    async def make_request(self, method: str, url: str, **kwargs) -> _Response:
+        if self.disconnect_requested:
+            raise AssertionError("Service already stoped")
+        headers = dict(kwargs.get("headers") or {})
+        headers.setdefault('User-Agent', "evo-mobile")
+        headers.setdefault('Platform', "android")
+        headers.setdefault('Accept', "*/*")
+        headers.setdefault('Device-Id', self._device_id)  # as the app: on sign-in too
+        try:
+            resp = await self._http(method, url, headers, kwargs.get("data"))
             # Handling 429 Too Many Requests with retry
             if resp.status_code == 429:
                 raise ManyRequestsError("429 Too Many Requests", response=resp)
@@ -624,27 +661,22 @@ class Haier(object):
             # Raise for other HTTP errors
             resp.raise_for_status()
             return resp
-        except (ConnectionError, NewConnectionError, socket.gaierror) as e:
+        except HaierConnectionError as e:
             _LOGGER.error(f"Network error occurred: {e}")
-            raise e  # Re-raise to allow retry mechanisms to handle this
-        except Timeout as e:
-            _LOGGER.error(f"Request timed out: {e}")
-            raise e
-        except HTTPError as e:
+            raise
+        except HaierHTTPError as e:
             _LOGGER.error(f"HTTP error occurred: {e}")
-            raise e
+            raise
 
-    @auth_login_limits.sleep_and_retry
     @auth_login_limits
-    def auth_login(self) -> AuthResponse:
+    async def auth_login(self) -> AuthResponse:
         try:
             path = urljoin(C.API_PATH, C.API_LOGIN.format(region=self.region))
             _LOGGER.debug(f"Logging in to {path}")
-            response = AuthResponse(self.make_request('POST', path, data={
+            response = AuthResponse(await self.make_request('POST', path, data={
                 'email': self.email,
                 'password': self.password
             }))
-            # _LOGGER.info(f"Login status code: {response.status_code}")
             response.raise_for_error()
         except ManyRequestsError as e:
             self.auth_login_limits.add_period(C.LOGIN_LIMIT_429)
@@ -656,7 +688,7 @@ class Haier(object):
         except AuthUserError as e:
             self.disconnect_requested = True
             raise e
-        except HTTPError as e:
+        except HaierHTTPError as e:
             # HTTP 5xx (or another non-429 error) from sign-in: back off as for an error body,
             # instead of retrying after the base period.
             self.auth_login_limits.add_period(C.LOGIN_LIMIT_500)
@@ -667,16 +699,14 @@ class Haier(object):
             self.auth_refresh_limits.reset()
         return response
 
-    @auth_refresh_limits.sleep_and_retry
     @auth_refresh_limits
-    def auth_refresh(self) -> AuthResponse:
+    async def auth_refresh(self) -> AuthResponse:
         try:
             path = urljoin(C.API_PATH, C.API_TOKEN_REFRESH.format(region=self.region))
             _LOGGER.debug(f"Refreshing token in to {path}")
-            response = AuthResponse(self.make_request('POST', path, data={
+            response = AuthResponse(await self.make_request('POST', path, data={
                 'refreshToken': self.refreshtoken
             }))
-            # _LOGGER.info(f"Refresh status code: {response.status_code}")
             response.raise_for_error()
         except ManyRequestsError as e:
             self.auth_refresh_limits.add_period(C.REFRESH_LIMIT_429)
@@ -689,9 +719,9 @@ class Haier(object):
             _LOGGER.error(str(e))
             self.auth_refresh_limits.add_period(C.REFRESH_LIMIT_500)
             response = e.response
-        except HTTPError as e:
+        except HaierHTTPError as e:
             self.auth_refresh_limits.add_period(C.REFRESH_LIMIT_500)
-            status = getattr(e.response, "status_code", None)
+            status = e.status
             if status is not None and 400 <= status < 500:
                 # The refresh token itself is refused (not via validation.refreshToken): drop
                 # it, so the next auth() signs in with the password instead of retrying it.
@@ -705,17 +735,24 @@ class Haier(object):
             self.auth_login_limits.reset()
         return response
 
-    @retry(
-        retry=retry_if_exception_type(AuthValidationError),
-        stop=stop_after_attempt(2),
-    )
-    def login(self, refresh: bool = False) -> None:
+    async def login(self, refresh: bool = False) -> None:
+        # A rejected refresh token (validation.refreshToken) clears the tokens: the second
+        # attempt signs in with the password (tenacity's retry of the threaded versions).
+        for attempt in (1, 2):
+            try:
+                await self._login_once(refresh)
+                return
+            except AuthValidationError:
+                if attempt == 2:
+                    raise
+
+    async def _login_once(self, refresh: bool) -> None:
         resp = None
         try:
             if refresh and self.refreshtoken:  # token refresh
-                resp = self.auth_refresh()
+                resp = await self.auth_refresh()
             else:  # initial login
-                resp = self.auth_login()
+                resp = await self.auth_login()
             assert resp, "No response from login"
             self.token = resp.access_token
             self.tokenexpire = resp.access_expire
@@ -727,7 +764,9 @@ class Haier(object):
             self.refreshtoken = resp.refresh_token
             self.refreshexpire = resp.refresh_expire
             self._token_obtained_at = time.monotonic()
-            self.save_tokens()
+            # A task async_stop() lets finish: a rotated refresh token must reach the file even
+            # if the unload cancels the caller right now.
+            await asyncio.shield(self._create_task(self.async_save_tokens(), "save tokens"))
         except AuthValidationError as e:
             raise e
         except AuthUserError as e:
@@ -743,6 +782,8 @@ class Haier(object):
             # on — surface the failure instead of pretending auth succeeded with an empty token.
             _LOGGER.error(f"Assertion error: {e}")
             raise InvalidAuth()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _LOGGER.error(
                 f"Failed to login/refresh token, "
@@ -766,15 +807,13 @@ class Haier(object):
                 return "refresh"
         return "login"
 
-    def auth(self) -> None:
-        # One login/refresh at a time (_auth_lock). The rate-limiter waits inside login() (up to
-        # LOGIN_LIMIT_MAX) happen outside self._lock, so invalidate_token() — called from the WS
-        # thread — and the device-refresh TTL check never wait behind them.
-        with self._auth_lock:
-            with self._lock:
-                action = self._auth_action()
+    async def auth(self) -> None:
+        # One login/refresh at a time (_auth_lock); the rate-limiter waits inside login() (up to
+        # LOGIN_LIMIT_MAX) do not hold anything else up.
+        async with self._auth_lock:
+            action = self._auth_action()
             if action is not None:
-                self.login(refresh=action == "refresh")
+                await self.login(refresh=action == "refresh")
 
     def invalidate_token(self, rejected: str | None, reason: str, rejected_by_server: bool = True) -> bool:
         # The server rejected an access token that is still valid by the LOCAL expiry clock
@@ -783,38 +822,38 @@ class Haier(object):
         # with it every few seconds, REST failed with 401 and every command was lost. Expire it
         # locally so the next auth() refreshes it (or logs in again if the refresh token is
         # dead too). Returns True when the token was expired here.
-        with self._lock:
-            if not rejected or rejected != self.token or self.tokenexpire is None:
-                return False  # already replaced or invalidated by another thread
-            obtained = self._token_obtained_at
-            if obtained is not None and time.monotonic() - obtained < C.TOKEN_REJECT_MIN_AGE:
-                # Even a just-issued token is rejected — refreshing again right away would
-                # only spin the auth endpoints; let it age first.
-                _LOGGER.debug(f"Fresh access token rejected ({reason}), not refreshing yet")
-                return False
-            if rejected_by_server:
-                _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
-            else:
-                _LOGGER.info(f"Forcing an access token refresh: {reason}")
-            self.tokenexpire = None
-            self.save_tokens()
-            return True
+        if not rejected or rejected != self.token or self.tokenexpire is None:
+            return False  # already replaced or invalidated meanwhile
+        obtained = self._token_obtained_at
+        if obtained is not None and time.monotonic() - obtained < C.TOKEN_REJECT_MIN_AGE:
+            # Even a just-issued token is rejected — refreshing again right away would
+            # only spin the auth endpoints; let it age first.
+            _LOGGER.debug(f"Fresh access token rejected ({reason}), not refreshing yet")
+            return False
+        if rejected_by_server:
+            _LOGGER.warning(f"Access token rejected by the server ({reason}), forcing a refresh")
+        else:
+            _LOGGER.info(f"Forcing an access token refresh: {reason}")
+        self.tokenexpire = None
+        self._schedule_save_tokens()
+        return True
 
-    def _authorized_get(self, url: str) -> requests.Response:
+    async def _authorized_get(self, url: str) -> Any:
         # A 401 means the token is no longer accepted although it has not expired locally:
         # invalidate it and retry once with a refreshed one. A 5xx is also retried once.
+        # Returns the decoded JSON answer.
         path = urlparse(url).path
         replaced = None  # the token a 401 made us replace
         for attempt in (1, 2):
-            self.auth()
+            await self.auth()
             token = self.token
-            response = requests.get(url, headers={
+            response = await self._http("GET", url, {
                 'X-Auth-Token': token,
                 'User-Agent': 'evo-mobile',
                 'Platform': 'android',
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
-            }, timeout=C.API_TIMEOUT, allow_redirects=False)
+            })
             if attempt == 1 and response.status_code == 401 and self._non_token_401.get(path, 0) < time.monotonic():
                 if self.invalidate_token(token, f"HTTP 401 from {path}"):
                     replaced = token
@@ -835,33 +874,34 @@ class Haier(object):
                     self.restart_session(self._connected_at, "its access token was rejected (HTTP 401)")
             refuse_redirect(response)
             response.raise_for_status()
-            return response
+            return response.json()
 
-    def pull_data_from_api(self) -> dict:
+    async def async_pull_data_from_api(self) -> dict:
         # Errors propagate on purpose: async_setup_entry turns them into ConfigEntryNotReady,
         # so HA retries the setup instead of leaving the entry in a permanent setup error.
         devices_path = urljoin(C.API_PATH, C.API_DEVICES.format(region=self.region))
         _LOGGER.debug(f"Getting devices, url: {devices_path}")
         try:
-            data = self._authorized_get(devices_path).json().get("data", {})
+            body = await self._authorized_get(devices_path)
         except Exception as e:
             _LOGGER.error(f"Failed to get devices: {e!r}")
             raise
+        data = body.get("data", {}) if isinstance(body, dict) else None
         if not isinstance(data, dict):
             raise InvalidDevicesList(f"Data is not dict: {data}")
         return data
 
-    def pull_device_data(self, device_mac: str) -> dict:
+    async def async_pull_device_data(self, device_mac: str) -> dict:
         status_url = C.API_STATUS.format(mac=device_mac)
         _LOGGER.debug(f"Getting initial status of device {device_mac}, url: {status_url}")
         try:
-            return self._authorized_get(status_url).json()
+            return await self._authorized_get(status_url)
         except Exception as e:
             _LOGGER.error(f"Failed to get status: {e!r}")
             raise
 
-    def pull_data(self) -> None:
-        data = self.pull_data_from_api()
+    async def async_pull_data(self) -> None:
+        data = await self.async_pull_data_from_api()
         if not data:
             raise InvalidDevicesList()
         specs, used, components = self._parse_device_specs(data)
@@ -869,7 +909,9 @@ class Haier(object):
         self._pull_data = {"presentation": {"layout": {"scrollContainer": used}}}
         for spec in specs:
             try:
-                device = HaierDevice.create(haier=self, **spec)
+                device = await HaierDevice.async_create(haier=self, **spec)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 # One appliance failing to fetch/parse (e.g. its status endpoint 5xx-es)
                 # must not abort discovery of the others; heartbeat() retries it later
@@ -883,7 +925,7 @@ class Haier(object):
             _LOGGER.info(f"Added device: {device}")
         self.no_devices_listed = not specs
         if self.devices:
-            self.connect_in_thread()
+            self.start_websocket()
         elif not specs:
             _LOGGER.warning(
                 f"No devices found on the Evo «Мой дом» page (its components: {components}). "
@@ -1006,14 +1048,16 @@ class Haier(object):
         # Kept so that a device loaded after setup (see retry_pending_devices) gets its entities.
         self._platform_add_entities[platform] = async_add_entities
 
-    def retry_pending_devices(self) -> None:
+    async def async_retry_pending_devices(self) -> None:
         now = time.monotonic()
         for pending in list(self._pending_devices):
-            if now < pending["next_at"]:
+            if now < pending["next_at"] or self.disconnect_requested:
                 continue
             spec = pending["spec"]
             try:
-                device = HaierDevice.create(haier=self, **spec)
+                device = await HaierDevice.async_create(haier=self, **spec)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 # Every heartbeat at first, then less often (up to hourly): the device may be
                 # gone for good, and each failed attempt logs an error.
@@ -1024,12 +1068,14 @@ class Haier(object):
                 )
                 _LOGGER.debug(f"Device {spec['device_mac']!r} still unavailable: {e}")
                 continue
+            if self.disconnect_requested:
+                return
             self._pending_devices.remove(pending)
             self.devices.append(device)
             _LOGGER.info(f"Added device after retry: {device}")
-            self.hass.loop.call_soon_threadsafe(self._async_add_device_entities, device)
-            if self.socket_thread is None or not self.socket_thread.is_alive():
-                self.connect_in_thread()  # the first device: nothing was connected yet
+            self._async_add_device_entities(device)
+            if self._ws_task is None or self._ws_task.done():
+                self.start_websocket()  # the first device: nothing was connected yet
             elif self._is_socket_ready():
                 # Its status snapshot of the current session was dropped while it was pending:
                 # start its session state the way _on_open does for the other devices.
@@ -1072,25 +1118,24 @@ class Haier(object):
             if entities := self._device_entities(device, platform):
                 async_add_entities(entities)
 
-    def refresh_devices(self, force: bool = False) -> None:
+    async def async_refresh_devices(self, force: bool = False) -> None:
         # Re-fetch the current state of all devices with TTL protection, so that frequent
         # calls to the GET endpoint do not trigger a flood of REST requests.
         if not self.devices:
             return
         now = time.monotonic()
-        # Only the TTL check/update is guarded; the network refresh runs outside the lock
-        # (pull_device_data -> auth() also takes this lock, so holding it here would deadlock).
-        with self._lock:
-            if (
-                not force
-                and self._last_refresh is not None
-                and (now - self._last_refresh) < C.API_REFRESH_TTL
-            ):
-                return
-            self._last_refresh = now
-        for device in self.devices:
+        if (
+            not force
+            and self._last_refresh is not None
+            and (now - self._last_refresh) < C.API_REFRESH_TTL
+        ):
+            return
+        self._last_refresh = now
+        for device in list(self.devices):
             try:
-                device.refresh()
+                await device.async_refresh()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 _LOGGER.warning(f"Failed to refresh device {device.device_id}: {e}")
 
@@ -1100,27 +1145,16 @@ class Haier(object):
             self.devices
         ), None)
 
-    def _init_ws(self) -> None:
-        self.auth()
-        self._ws_token = self.token
-        if self._ws_sslopt is None:
-            self._ws_sslopt = {"context": _ws_ssl_context(C.WS_CONNECT_TIMEOUT)}
-        url = urljoin(C.API_WS_PATH, self.token)
-        if self.socket_app is None:
-            self.socket_app = WebSocketApp(
-                url=url,
-                on_message=self._on_message,
-                on_open=self._on_open,
-                # No on_ping: websocket-client answers server pings itself (the old handler
-                # had the wrong signature and raised TypeError on every ping).
-                on_close=self._on_close,
-                on_error=self._on_error,
-            )
-        else:
-            self.socket_app.url = url
+    def _ws_url(self, token: str) -> str:
+        # The access token is the last segment of the websocket URL: never log the URL.
+        return urljoin(C.API_WS_PATH, token)
 
-    # noinspection PyUnusedLocal
-    def _on_message(self, ws: WebSocket, message: str) -> None:
+    @staticmethod
+    def _scrub(text: str, token: str | None) -> str:
+        # An error text that may quote the websocket URL, without the token in it.
+        return text.replace(token, "***") if token else text
+
+    def _on_message(self, message: str) -> None:
         self._last_inbound_at = time.monotonic()
         if self._silent_sessions:
             self._silent_sessions = 0
@@ -1150,14 +1184,7 @@ class Haier(object):
             # One odd message must not cost the others their handling.
             _LOGGER.exception(f"Failed to handle the {message_dict.get('event')!r} message for {device.device_name}")
 
-    # noinspection PyMethodMayBeStatic,PyUnusedLocal
-    def _on_open(self, ws: WebSocket) -> None:
-        if self.disconnect_requested:
-            # stop() ran while this connection was being established — do not leave a session
-            # of an unloaded entry open (it would live on until the server drops it).
-            _LOGGER.debug("Websocket opened after stop, closing it")
-            ws.close()
-            return
+    def _on_open(self) -> None:
         self.socket_status = SocketStatus.INITIALIZED
         self._connected_at = session = time.monotonic()
         _LOGGER.debug("Websocket opened")
@@ -1168,50 +1195,51 @@ class Haier(object):
             except Exception:
                 # Must not skip the other devices nor the silent-session check below.
                 _LOGGER.exception(f"Failed to prepare {device.device_name} for the new websocket session")
-        timer = threading.Timer(C.WS_SILENT_SESSION_TIMEOUT, self._check_silent_session, args=(session,))
-        timer.daemon = True
-        timer.start()
+        if self._silent_timer is not None:
+            self._silent_timer.cancel()
+        self._silent_timer = self.hass.loop.call_later(
+            C.WS_SILENT_SESSION_TIMEOUT, self._check_silent_session, session
+        )
 
     def _check_silent_session(self, session: float) -> None:
         # The cloud pushes a status snapshot right after a session opens and answers every
         # command. A session it has sent nothing over is accepted but not served: no updates
-        # arrive and commands are lost. It is dropped here and connect() opens the next one
+        # arrive and commands are lost. It is dropped here and the loop opens the next one
         # after a growing delay (silent sessions count as failed there): a silent session has
         # been seen followed by a served one. The WS_SILENT_SESSIONS_FRESH_TOKEN-th silent
         # session in a row is re-established with a freshly refreshed access token, in case
         # the cloud serves only the sessions of its newest token. The first silent session is
-        # logged as a warning, the following ones at INFO (runs in a timer thread).
+        # logged as a warning, the following ones at INFO.
+        self._silent_timer = None
         if self.disconnect_requested or session != self._connected_at or not self.devices:
             return
-        with self._restart_lock:
-            if self.disconnect_requested or session != self._connected_at or not self._is_socket_ready():
-                return  # the session is gone (closed, being re-established) — not a silent one
-            if self._last_inbound_at is not None and self._last_inbound_at >= session:
-                return
-            self._silent_sessions = count = self._silent_sessions + 1
-            if count == 1:
-                _LOGGER.warning(
-                    f"The Haier cloud accepted the websocket session but has sent nothing over it "
-                    f"for {C.WS_SILENT_SESSION_TIMEOUT:.0f}s: it delivers no device updates and no "
-                    f"command answers to it. Re-establishing the session; check that the devices "
-                    f"respond in the Evo app."
-                )
-            else:
-                _LOGGER.info(
-                    f"The Haier cloud has sent nothing over the websocket session again for "
-                    f"{C.WS_SILENT_SESSION_TIMEOUT:.0f}s ({count} silent sessions in a row), "
-                    f"re-establishing it"
-                )
-            if count == C.WS_SILENT_SESSIONS_FRESH_TOKEN:
-                self.invalidate_token(
-                    self._ws_token, f"{count} websocket sessions in a row were silent",
-                    rejected_by_server=False,
-                )
-            self._session_silent = True
-            self._force_reconnect()
+        if not self._is_socket_ready():
+            return  # the session is gone (closed, being re-established) — not a silent one
+        if self._last_inbound_at is not None and self._last_inbound_at >= session:
+            return
+        self._silent_sessions = count = self._silent_sessions + 1
+        if count == 1:
+            _LOGGER.warning(
+                f"The Haier cloud accepted the websocket session but has sent nothing over it "
+                f"for {C.WS_SILENT_SESSION_TIMEOUT:.0f}s: it delivers no device updates and no "
+                f"command answers to it. Re-establishing the session; check that the devices "
+                f"respond in the Evo app."
+            )
+        else:
+            _LOGGER.info(
+                f"The Haier cloud has sent nothing over the websocket session again for "
+                f"{C.WS_SILENT_SESSION_TIMEOUT:.0f}s ({count} silent sessions in a row), "
+                f"re-establishing it"
+            )
+        if count == C.WS_SILENT_SESSIONS_FRESH_TOKEN:
+            self.invalidate_token(
+                self._ws_token, f"{count} websocket sessions in a row were silent",
+                rejected_by_server=False,
+            )
+        self._session_silent = True
+        self._force_reconnect()
 
-    # noinspection PyMethodMayBeStatic,PyUnusedLocal
-    def _on_close(self, ws: WebSocket, close_code: int, close_message: str) -> None:
+    def _on_close(self, close_code: int | None, close_message: str | None) -> None:
         # Reflect that the socket is down so connect_if_needed/_wait_websocket do not
         # treat a connection that is being re-established as still INITIALIZED.
         self.socket_status = SocketStatus.NOT_INITIALIZED
@@ -1221,49 +1249,17 @@ class Haier(object):
         if close_code == C.WS_CLOSE_AUTH_FAILED or "token" in str(close_message or "").lower():
             self.invalidate_token(self._ws_token, f"WS closed: {close_code} {close_message!r}")
 
-    # noinspection PyUnusedLocal
-    def _on_error(self, ws: WebSocket, error: BaseException) -> None:
-        # websocket-client reports here both exceptions raised in our own callbacks and connection
-        # failures (DNS, TLS, handshake status, timeouts). Without this handler it only logs them
-        # through the "websocket" logger, which logger.py mutes for its noise — they were lost.
-        if isinstance(error, (WebSocketException, OSError)):
-            # The server dropping the connection is routine (e.g. when the token expires).
-            level = logging.INFO if isinstance(error, WebSocketConnectionClosedException) else logging.WARNING
-            _LOGGER.log(level, f"Websocket error: {type(error).__name__}: {error}")
-        elif self._raised_here(error):
-            _LOGGER.error(
-                f"Error while handling a websocket event: {error!r}",
-                exc_info=(type(error), error, error.__traceback__),
-            )
-        else:
-            # websocket-client itself tripping over a session that was closed meanwhile (e.g.
-            # closed in on_open after stop()) — harmless.
-            _LOGGER.info(f"Websocket session ended while starting: {type(error).__name__}: {error}")
-
-    @staticmethod
-    def _raised_here(error: BaseException) -> bool:
-        # True when the traceback passes through this integration's code.
-        here = os.path.dirname(os.path.abspath(__file__))
-        tb = error.__traceback__
-        while tb is not None:
-            if os.path.abspath(tb.tb_frame.f_code.co_filename).startswith(here):
-                return True
-            tb = tb.tb_next
-        return False
-
-    def _wait_websocket(self, timeout: float) -> None:
-        # Waits for a usable session, not just the status flag: right after a close (e.g. by
-        # restart_session) the flag still reads INITIALIZED until _on_close runs — up to a few
-        # seconds — and a resend that trusted it failed twice and was lost.
-        current = time.time()
-        while time.time() <= (current + timeout) and not self.disconnect_requested:
+    async def _wait_websocket(self, timeout: float) -> None:
+        # Waits for a usable session, not just the status flag.
+        start = time.monotonic()
+        while time.monotonic() <= (start + timeout) and not self.disconnect_requested:
             if self._is_socket_ready():
                 _LOGGER.info(
                     f"_wait_websocket: socket became INITIALIZED after "
-                    f"{time.time() - current:.2f}s"
+                    f"{time.monotonic() - start:.2f}s"
                 )
                 return
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
         if self.disconnect_requested:
             return
         _LOGGER.warning(
@@ -1278,12 +1274,12 @@ class Haier(object):
             device.write_ha_state()
 
     def is_socket_connected(self) -> bool:
-        sock = getattr(self.socket_app, "sock", None)
-        return bool(sock is not None and getattr(sock, "connected", False))
+        ws = self._ws
+        return ws is not None and not ws.closed
 
     def _is_socket_ready(self) -> bool:
         # Ready to send only when both signals agree: the status flag is INITIALIZED
-        # (set by _on_open / cleared by _on_close) and the underlying sock is connected.
+        # (set by _on_open / cleared by _on_close) and the session is open.
         return self.socket_status == SocketStatus.INITIALIZED and self.is_socket_connected()
 
     def _is_session_stale(self) -> bool:
@@ -1299,56 +1295,49 @@ class Haier(object):
         return (time.monotonic() - last_activity) > C.WS_SESSION_STALE_TIMEOUT
 
     def _force_reconnect(self) -> None:
-        # Dropping the session makes run_forever() return; the connect() loop in the
-        # socket thread then re-establishes the session (refreshing the token).
+        # Dropping the session ends its read loop; the connection loop then re-establishes it
+        # (refreshing the token). The session counts as down at once.
         self._drop_session()
-        # _on_close fires asynchronously; wait until the stale INITIALIZED state is
-        # gone so the follow-up connect_if_needed() waits for the NEW session instead
-        # of returning immediately on the old one.
-        deadline = time.monotonic() + 1.0
-        while self._is_socket_ready() and time.monotonic() < deadline:
-            time.sleep(0.05)
 
     def restart_session(self, session: float | None, reason: str) -> bool:
         # Re-establishes the WS session the caller saw (session = its _connected_at). Several
         # callers may detect the same dead session at once (e.g. two unanswered commands):
         # only the first one restarts it, a session that is already down or newer is left
-        # alone. Must not run in the WS thread (_force_reconnect waits for that thread).
-        with self._restart_lock:
-            if self.disconnect_requested or session != self._connected_at or not self._is_socket_ready():
-                return False
-            _LOGGER.warning(f"Re-establishing the websocket session: {reason}")
-            self._force_reconnect()
-            return True
+        # alone.
+        if self.disconnect_requested or session != self._connected_at or not self._is_socket_ready():
+            return False
+        _LOGGER.warning(f"Re-establishing the websocket session: {reason}")
+        self._force_reconnect()
+        return True
 
-    def connect_if_needed(self, timeout: float = 4.0) -> None:
+    async def connect_if_needed(self, timeout: float = 4.0) -> None:
         if self.disconnect_requested:
             return
-        if self.socket_thread and self.socket_thread.is_alive():
+        if self._ws_task is not None and not self._ws_task.done():
             _LOGGER.info(
-                "connect_if_needed: socket thread is alive, waiting for it to come up "
+                "connect_if_needed: the connection loop runs, waiting for it to come up "
                 f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)})"
             )
             # A reconnect backoff in progress ends now: a command needs the session.
-            self._wake_event.set()
-            return self._wait_websocket(timeout)
-        # No live thread: start one. Note that connect_in_thread does NOT block, so the
-        # caller may re-check the connection before it is actually up — a frequent reason
-        # the very first command after startup/idle is lost.
+            self._wake.set()
+            return await self._wait_websocket(timeout)
+        # No connection loop: start one. It does not wait for the connection, so the caller
+        # may re-check it before it is actually up.
         _LOGGER.info(
-            "connect_if_needed: no live socket thread, starting a new connection thread "
+            "connect_if_needed: no websocket connection loop, starting it "
             "(connection will come up asynchronously)"
         )
-        return self.connect_in_thread()
+        self.start_websocket()
 
-    def connect(self) -> None:
+    async def _async_ws_loop(self) -> None:
+        # The connection loop (the WS thread's connect() of the threaded versions).
         self.socket_status = SocketStatus.NOT_INITIALIZED
         failures = 0
         while not self.disconnect_requested:
             opened_before = self._connected_at
             self._session_dropped = False
             self._session_silent = False
-            self.run_forever()
+            await self._async_run_session()
             if self.disconnect_requested:
                 break
             # Back off when sessions keep failing (refused, closed before delivering anything, or
@@ -1364,50 +1353,56 @@ class Haier(object):
                 failures = 0
                 continue
             failures += 1
-            delay = min(5 * 2 ** (failures - 1), C.WS_RECONNECT_BACKOFF_MAX)
+            delay = min(C.WS_RECONNECT_BACKOFF_MIN * 2 ** (failures - 1), C.WS_RECONNECT_BACKOFF_MAX)
             _LOGGER.info(
                 f"Websocket session {'stayed silent' if silent else 'failed'} ({failures} in a row), "
                 f"next attempt in {delay}s"
             )
-            # stop() and a command that needs the session (connect_if_needed) cut the wait short.
-            self._wake_event.clear()
+            # async_stop() and a command that needs the session (connect_if_needed) cut the
+            # wait short.
+            self._wake.clear()
             if not self.disconnect_requested:
-                self._wake_event.wait(delay)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(self._wake.wait(), delay)
         _LOGGER.debug("Connection stoped")
 
-    def connect_in_thread(self) -> None:
-        self.socket_thread = thread = threading.Thread(target=self.connect)
-        thread.daemon = True
-        thread.start()
+    def start_websocket(self) -> None:
+        if self.disconnect_requested:
+            return
+        self._ws_task = self.hass.async_create_background_task(
+            self._async_ws_loop(), f"{C.DOMAIN} websocket {self.entry_id}", eager_start=False,
+        )
 
-    def heartbeat(self) -> None:
+    async def async_heartbeat(self) -> None:
         # The interval timer does not wait for the previous run (which can take long: REST
         # timeouts, rate-limit waits) — skip a tick instead of running twice in parallel.
-        if not self._heartbeat_lock.acquire(blocking=False):
+        if self._heartbeat_running:
             _LOGGER.debug("heartbeat: the previous run is still in progress, skipped")
             return
+        self._heartbeat_running = True
         try:
-            self._heartbeat()
+            # A task of the hub: an unload cancels a run in progress (REST reads, retries).
+            await asyncio.wait([self._create_task(self._async_heartbeat(), "heartbeat")])
         finally:
-            self._heartbeat_lock.release()
+            self._heartbeat_running = False
 
-    def _heartbeat(self) -> None:
-        # Called periodically off the event loop (see __init__.async_setup_entry). Realtime
-        # state arrives only via WS push, and a long-idle session can go "zombie" (ping/pong
-        # keeps TCP alive but the server stops delivering app messages), so a device the user
-        # only observes — e.g. a washing machine left idle — silently stops updating. This
-        # watchdog: (1) restarts a dead socket thread; (2) force-reconnects a stale/zombie
-        # session so the cloud pushes a fresh snapshot and realtime resumes; (3) re-pulls
-        # state over REST every tick as a fallback so values never freeze for longer than
-        # the heartbeat interval even if push has not yet resumed.
+    async def _async_heartbeat(self) -> None:
+        # Called periodically (see __init__.async_setup_entry). Realtime state arrives only via
+        # WS push, and a long-idle session can go "zombie" (ping/pong keeps TCP alive but the
+        # server stops delivering app messages), so a device the user only observes — e.g. a
+        # washing machine left idle — silently stops updating. This watchdog: (1) restarts a
+        # dead connection loop; (2) force-reconnects a stale/zombie session so the cloud
+        # pushes a fresh snapshot and realtime resumes; (3) re-pulls state over REST every tick
+        # as a fallback so values never freeze for longer than the heartbeat interval even if
+        # push has not yet resumed.
         if self.disconnect_requested:
             return
         try:
             if not self.devices:
                 pass  # nothing to connect for (devices still pending are connected when added)
-            elif self.socket_thread is None or not self.socket_thread.is_alive():
-                _LOGGER.info("heartbeat: socket thread not alive — starting a new connection")
-                self.connect_in_thread()
+            elif self._ws_task is None or self._ws_task.done():
+                _LOGGER.info("heartbeat: the connection loop is not running — starting a new one")
+                self.start_websocket()
             elif self._is_session_stale():
                 _LOGGER.info(
                     "heartbeat: WS session stale — forcing reconnect to resume realtime updates"
@@ -1416,11 +1411,15 @@ class Haier(object):
         except Exception as e:
             _LOGGER.warning(f"heartbeat reconnect check failed: {e}")
         try:
-            self.retry_pending_devices()
+            await self.async_retry_pending_devices()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _LOGGER.warning(f"heartbeat device retry failed: {e}")
         try:
-            self.refresh_devices(force=True)
+            await self.async_refresh_devices(force=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _LOGGER.warning(f"heartbeat refresh failed: {e}")
 
@@ -1432,81 +1431,134 @@ class Haier(object):
             return False
         return any(isinstance(d, HaierWM) and d.needs_poll(now) for d in list(self.devices))
 
-    def poll_active_laundry(self) -> None:
-        # Runs off the event loop every WM_ACTIVE_POLL_TICK seconds while wants_laundry_poll():
-        # re-reads over REST the washing machines that are on and have had no news of the cycle
-        # for WM_ACTIVE_POLL_INTERVAL seconds (see HaierWM.needs_poll).
-        if not self._laundry_poll_lock.acquire(blocking=False):
+    async def async_poll_active_laundry(self) -> None:
+        # Runs every WM_ACTIVE_POLL_TICK seconds while wants_laundry_poll(): re-reads over REST
+        # the washing machines that are on and have had no news of the cycle for
+        # WM_ACTIVE_POLL_INTERVAL seconds (see HaierWM.needs_poll). A task of the hub: an unload
+        # cancels a read in progress.
+        if self._laundry_poll_running or self.disconnect_requested:
             return  # the previous read is still running (REST timeout, slow cloud)
+        self._laundry_poll_running = True
         try:
-            for device in list(self.devices):
-                now = time.monotonic()
-                if self.disconnect_requested or now < self._laundry_poll_retry_at:
-                    return
-                if not (isinstance(device, HaierWM) and device.needs_poll(now)):
-                    continue
-                try:
-                    device.poll()
-                except Exception as e:
-                    self._laundry_poll_failures += 1
-                    delay = min(
-                        C.WM_ACTIVE_POLL_INTERVAL * 2 ** self._laundry_poll_failures,
-                        C.WM_ACTIVE_POLL_BACKOFF_MAX,
-                    )
-                    self._laundry_poll_retry_at = time.monotonic() + delay
-                    # A long cloud outage is reported once, not on every attempt.
-                    log = _LOGGER.warning if self._laundry_poll_failures == 1 else _LOGGER.debug
-                    log(f"Failed to read the state of {device.device_name} ({e}), next attempt in {delay:.0f}s")
-                    return
-                if self._laundry_poll_failures:
-                    _LOGGER.info(f"The state of {device.device_name} is read again")
-                self._laundry_poll_failures = 0
+            await asyncio.wait([self._create_task(self._async_poll_active_laundry(), "laundry poll")])
         finally:
-            self._laundry_poll_lock.release()
+            self._laundry_poll_running = False
 
-    @connect_limits.sleep_and_retry
+    async def _async_poll_active_laundry(self) -> None:
+        for device in list(self.devices):
+            now = time.monotonic()
+            if self.disconnect_requested or now < self._laundry_poll_retry_at:
+                return
+            if not (isinstance(device, HaierWM) and device.needs_poll(now)):
+                continue
+            try:
+                await device.async_poll()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._laundry_poll_failures += 1
+                delay = min(
+                    C.WM_ACTIVE_POLL_INTERVAL * 2 ** self._laundry_poll_failures,
+                    C.WM_ACTIVE_POLL_BACKOFF_MAX,
+                )
+                self._laundry_poll_retry_at = time.monotonic() + delay
+                # A long cloud outage is reported once, not on every attempt.
+                log = _LOGGER.warning if self._laundry_poll_failures == 1 else _LOGGER.debug
+                log(f"Failed to read the state of {device.device_name} ({e}), next attempt in {delay:.0f}s")
+                return
+            if self._laundry_poll_failures:
+                _LOGGER.info(f"The state of {device.device_name} is read again")
+            self._laundry_poll_failures = 0
+
     @connect_limits
-    def run_forever(self) -> None:
-        # stop() resets the limiters to wake sleeping threads, so this thread may come out of
-        # the reconnect wait AFTER stop(): it must not open a new session for an unloaded entry.
+    async def _async_run_session(self) -> None:
+        # One websocket session (run_forever + on_open/on_message/on_close of the threaded
+        # versions): sign-in, connect, read until it ends. Errors are logged here.
         if self.disconnect_requested:
             return
         _LOGGER.debug(f"Connecting to websocket ({C.API_WS_PATH})")
+        ws = None
+        token = None
+        opened = False
+        close_code, close_message = None, None
         try:
             self.socket_status = SocketStatus.INITIALIZING
-            self._init_ws()
-            # ping_timeout is required to detect a half-open (silently dead) connection:
-            # without it run_forever blocks forever on a dead socket and never reconnects.
-            self.socket_app.run_forever(
-                ping_interval=C.WS_PING_INTERVAL,
-                ping_timeout=C.WS_PING_TIMEOUT,
-                sockopt=_ws_sockopt(),
-                sslopt=self._ws_sslopt,
-            )
+            await self.auth()
+            self._ws_token = token = self.token
+            # Bounded: aiohttp sets no limit for the TCP connect, the TLS handshake and the HTTP
+            # upgrade of a websocket (a server that never answered kept the loop connecting).
+            # heartbeat: a ping every WS_PING_INTERVAL s, no pong within half of it closes the
+            # socket — a half-open (silently dead) connection is detected and replaced.
+            async with asyncio.timeout(C.WS_CONNECT_TIMEOUT):
+                ws = await self._session.ws_connect(
+                    self._ws_url(token),
+                    heartbeat=C.WS_PING_INTERVAL,
+                    timeout=ClientWSTimeout(ws_receive=None, ws_close=C.WS_CLOSE_TIMEOUT),
+                )
+            if self.disconnect_requested:
+                # async_stop() ran while this connection was being established — do not leave
+                # a session of an unloaded entry open.
+                _LOGGER.debug("Websocket opened after stop, closing it")
+                return
+            self._ws = ws
+            self._on_open()
+            opened = True
+            while True:
+                msg = await ws.receive()
+                if msg.type == WSMsgType.TEXT:
+                    self._on_message(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    self._on_message(msg.data.decode("utf-8", errors="replace"))
+                elif msg.type == WSMsgType.CLOSE:
+                    close_code, close_message = msg.data, msg.extra
+                    break
+                elif msg.type in (WSMsgType.CLOSING, WSMsgType.CLOSED):
+                    break
+                elif msg.type == WSMsgType.ERROR:
+                    error = ws.exception() or msg.data
+                    _LOGGER.info(f"Websocket error: {type(error).__name__}: {error}")
+                    break
+        except asyncio.CancelledError:
+            raise
+        except WSServerHandshakeError as e:
+            # Its text holds the URL, i.e. the token: only the status is logged.
+            _LOGGER.warning(f"Websocket error: the upgrade was refused (HTTP {e.status})")
+            if e.status in (401, 403) and token is not None:
+                self.invalidate_token(token, f"WS upgrade refused (HTTP {e.status})")
+        except (ClientError, TimeoutError, OSError) as e:
+            _LOGGER.warning(f"Websocket error: {type(e).__name__}: {self._scrub(str(e), token)}")
         except Exception as e:
-            _LOGGER.error(f"Error connecting to websocket: {e}")
+            _LOGGER.error(f"Error connecting to websocket: {self._scrub(repr(e), token)}")
         finally:
-            # No session came up (sign-in or connection failed): not "connecting" any more while
-            # connect() waits for the next attempt.
-            if self.socket_status == SocketStatus.INITIALIZING:
+            if opened and self._silent_timer is not None:
+                # The silence check belongs to this session (sessions run one after another).
+                self._silent_timer.cancel()
+                self._silent_timer = None
+            if self._ws is ws:
+                self._ws = None
+            if ws is not None:
+                if not ws.closed:
+                    with suppress(Exception):
+                        await ws.close()
+                if close_code is None:
+                    close_code = ws.close_code
+                self._on_close(close_code, close_message)
+            elif self.socket_status == SocketStatus.INITIALIZING:
+                # No session came up (sign-in or connection failed): not "connecting" any more
+                # while the loop waits for the next attempt.
                 self.socket_status = SocketStatus.NOT_INITIALIZED
 
-    @retry(
-        retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(2),
-        retry_error_callback=_log_send_message_failure,
-        wait=wait_fixed(1.0),
-    )
-    def send_message(self, payload: str) -> bool:
-        # A long-idle socket may be down or half-open: a send() into it can either raise or —
-        # worse — return successfully and then the socket closes a few ms later, silently
-        # losing the command (no exception, so the retry never fires). To avoid that we:
-        #   1) serialize all sends (concurrent writes corrupt frames),
-        #   2) fail fast on a dead socket before sending (reconnect, else raise -> retry),
-        #   3) re-check right after sending and, if the socket just closed, raise -> retry
+    async def async_send_message(self, payload: str) -> bool:
+        # A long-idle socket may be down or half-open: a send into it can either raise or —
+        # worse — succeed and then the socket closes a few ms later, silently losing the
+        # command. To avoid that we:
+        #   1) serialize all sends,
+        #   2) fail fast on a dead socket before sending (reconnect, else retry),
+        #   3) re-check right after sending and, if the socket just closed, retry
         #      (which reconnects and resends; all our commands carry absolute values, so a
         #       duplicate resend is harmless).
-        # Returns True once the payload is on the wire, False when every attempt failed.
+        # Two attempts, 1 s apart. Returns True once the payload is on the wire, False when
+        # every attempt failed.
         if self.disconnect_requested:
             # The entry is unloaded (e.g. a command still waiting while it was reloaded) or its
             # sign-in was rejected: this instance opens no websocket any more.
@@ -1515,14 +1567,36 @@ class Haier(object):
                 f"Payload: {payload}"
             )
             return False
-        with self._send_lock:
+        error = None
+        for attempt in (1, 2):
+            if self.disconnect_requested:
+                _LOGGER.info(
+                    f"Command not sent: the integration entry is unloaded or its sign-in was rejected. "
+                    f"Payload: {payload}"
+                )
+                return False
+            try:
+                return await self._send_once(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                error = e
+                if attempt == 1 and not self.disconnect_requested:
+                    await asyncio.sleep(1.0)
+        # The device's ACK watchdog still resends the command once (HaierDevice._on_ack_timeout):
+        # a dropped command — in particular the first one after an idle period — is logged.
+        _LOGGER.error(f"Command NOT sent after 2 attempt(s). Last error: {error!r}. Payload: {payload}")
+        return False
+
+    async def _send_once(self, payload: str) -> bool:
+        async with self._send_lock:
             if not self._is_socket_ready():
                 _LOGGER.warning(
                     f"Socket not ready before send "
                     f"(socket_status={getattr(self.socket_status, 'name', self.socket_status)}, "
                     f"connected={self.is_socket_connected()}), reconnecting before sending"
                 )
-                self.connect_if_needed()
+                await self.connect_if_needed()
                 if not self._is_socket_ready():
                     raise ConnectionError("Socket not ready after reconnect attempt")
             elif self._is_session_stale():
@@ -1531,25 +1605,26 @@ class Haier(object):
                     f"{C.WS_SESSION_STALE_TIMEOUT}s — reconnecting before send"
                 )
                 self._force_reconnect()
-                self.connect_if_needed()
+                await self.connect_if_needed()
                 if not self._is_socket_ready():
                     raise ConnectionError("Socket not ready after stale-session reconnect")
             _LOGGER.info(f"Sending message: {payload}")
+            ws = self._ws
             try:
-                self.socket_app.send(payload)
+                await ws.send_str(payload)
             except Exception as e:
                 _LOGGER.warning(f"Failed to send message (will retry): {e!r}. Payload: {payload}")
-                self.connect_if_needed()
+                await self.connect_if_needed()
                 raise e
-            # Post-send check: catch a silent loss when the socket closes right after send()
-            # returned (observed ~25ms after send in debug logs). A short window is enough.
-            time.sleep(C.WS_POST_SEND_CHECK)
-            if not self._is_socket_ready():
+            # Post-send check: catch a silent loss when the socket closes right after the send
+            # (observed ~25ms after send in debug logs). A short window is enough.
+            await asyncio.sleep(C.WS_POST_SEND_CHECK)
+            if not self._is_socket_ready() or self._ws is not ws:
                 _LOGGER.warning(
                     f"Socket closed right after send — message likely lost, retrying. "
                     f"Payload: {payload}"
                 )
-                self.connect_if_needed()
+                await self.connect_if_needed()
                 raise ConnectionError("Socket closed right after send")
             return True
 
@@ -1574,32 +1649,33 @@ class HaierDevice(object):
         self._available = True
         self._config = None
         self._status_data = backend_data
-        # Guards config rebuild (refresh) against concurrent reads from the WS thread.
-        self._lock = threading.Lock()
+        # Everything of a device runs in the event loop: state, config rebuilds and commands
+        # are not guarded by locks (no await between a check and its use), except the record +
+        # send of a command (_cmd_lock).
         # True while a post-rejection refresh is scheduled/running (see on_message).
         self._reject_refresh_pending = False
         # Diagnostics: last value we sent per attribute code, and when this WS session
         # first received any inbound message (proxy for "cloud attached our session").
         self._sent_commands: dict[str, dict] = {}
-        # Guards _sent_commands: it is written from HA executor threads (_record_sent)
-        # and read/mutated from the WS thread (correlation/suppression/ack). Lock ordering
-        # is always self._lock -> self._sent_lock (never the reverse) to avoid deadlock.
-        self._sent_lock = threading.Lock()
         self._session_ready_at = None
         # True once a full status snapshot (all attributes at once) has been received
         # over WS — see init_if_needed/_init_snapshot_fallback.
         self._snapshot_seen = False
         # Commands sent but not answered (command_response) yet: trace -> what was sent and
-        # where. Guarded by _sent_lock; see _on_ack_timeout.
+        # where; see _on_ack_timeout.
         self._awaiting_ack: dict[str, dict] = {}
         # Record + send of a command happen under this lock, so a resend and a newer command for
         # the same attribute reach the device in the order they were recorded.
-        self._cmd_lock = threading.RLock()
+        self._cmd_lock = asyncio.Lock()
+        # The ACK watchdog's timers (trace -> handle) and this device's tasks (follow-ups,
+        # resends, refreshes): cancelled when the entry is unloaded (cancel_pending).
+        self._ack_timers: dict[str, asyncio.TimerHandle] = {}
+        self._tasks: set[asyncio.Task] = set()
         # Last known raw values (normalised) per attribute code, for the API modifiers.
         self._raw: dict[str, str] = {}
         # Monotonic time of the last WS status update per attribute code, and the start of the
         # REST read being applied (refresh): a read that was requested before a push carries the
-        # older value and must not revert it (see _stale_codes). Guarded by self._lock.
+        # older value and must not revert it (see _stale_codes).
         self._pushed_at: dict[str, float] = {}
         self._read_started: float | None = None
         # The device's link to the cloud from deviceConnectionStatusEvent (GOOD / BAD / LOST).
@@ -1825,22 +1901,52 @@ class HaierDevice(object):
                 skip.add(code)
         return skip
 
-    def refresh(self) -> None:
-        # Re-fetch the device's fresh state over REST and re-parse it.
-        # The network call stays outside the lock; only the config rebuild is guarded
-        # so a concurrent WS status update cannot read a half-rebuilt config.
+    async def async_refresh(self) -> None:
+        # Re-fetch the device's fresh state over REST and re-parse it. The rebuild itself has no
+        # await: a WS status update cannot see a half-rebuilt config.
         started = time.monotonic()
-        data = self._haier.pull_device_data(self.device_id)
+        data = await self._haier.async_pull_device_data(self.device_id)
         if not self.valid_status(data):
             # e.g. an error body with HTTP 200: rebuilding from it would empty the config.
             raise ValueError(f"unexpected device config payload: {str(data)[:200]}")
-        with self._lock:
-            self._read_started = started
-            try:
-                self._get_status(data)
-            finally:
-                self._read_started = None
+        await self.async_preload_config(self.hass, data)
+        self._read_started = started
+        try:
+            self._get_status(data)
+        finally:
+            self._read_started = None
         self.write_ha_state()
+
+    @classmethod
+    def model_of(cls, data) -> str:
+        # The model as _get_status names it (the name of the device's YAML).
+        info = cls._device_part(data).get("info")
+        model = info.get("model", "AC") if isinstance(info, dict) else "AC"
+        model = "AC" if model is None else str(model)
+        return model.replace('-', '').replace('/', '')[:11]
+
+    @classmethod
+    async def async_preload_config(cls, hass: HomeAssistant, data) -> None:
+        # The device's YAML is found, copied and read in the executor (file work must not run
+        # in the event loop); the config classes then take it from the cache.
+        await CFG.async_preload(hass, cls.model_of(data), hass.config.path(C.DOMAIN))
+
+    def _create_task(self, coro: Coroutine, name: str) -> asyncio.Task:
+        # A task of this device, cancelled by cancel_pending() if it still runs then.
+        task = self.hass.async_create_background_task(
+            coro, f"{C.DOMAIN} {self.device_id} {name}", eager_start=False
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def cancel_pending(self) -> None:
+        # The entry is unloaded: no ACK watchdog, follow-up, resend or refresh runs any more.
+        for handle in self._ack_timers.values():
+            handle.cancel()
+        self._ack_timers.clear()
+        for task in list(self._tasks):
+            task.cancel()
 
     @staticmethod
     def valid_status(data) -> bool:
@@ -1852,19 +1958,20 @@ class HaierDevice(object):
 
     def _schedule_refresh_after_failure(self) -> None:
         # A command was rejected or lost, but set_* already applied its value optimistically:
-        # re-pull the real state. Called from the WS / timer threads; refresh() is a blocking
-        # REST call (API_TIMEOUT=15s) and must not run in the WS thread — it would stall
-        # ping/pong and message dispatch.
+        # re-pull the real state, a little later (the cloud settles; a burst of rejections, e.g.
+        # of a group command, makes one refresh).
         if self._reject_refresh_pending:
             return
         self._reject_refresh_pending = True
-        threading.Thread(target=self._refresh_after_failure, daemon=True).start()
+        self._create_task(self._refresh_after_failure(), "refresh after a failed command")
 
-    def _refresh_after_failure(self) -> None:
+    async def _refresh_after_failure(self) -> None:
         try:
-            time.sleep(C.COMMAND_REJECT_REFRESH_DELAY)
+            await asyncio.sleep(C.COMMAND_REJECT_REFRESH_DELAY)
             if not self._stopped():
-                self.refresh()
+                await self.async_refresh()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _LOGGER.warning(
                 f"Failed to refresh {self.device_name} after a failed command: {e}"
@@ -1903,17 +2010,16 @@ class HaierDevice(object):
         # attributes they carry (the raw "Received WSS message" log is only at DEBUG).
         _LOGGER.info(f"WS status update for {self.device_name}: {properties}")
         self._log_state_correlation(properties)
-        with self._lock:
-            now = time.monotonic()
-            for key, value in properties.items():
-                self._pushed_at[str(key)] = now
-                # A status snapshot that arrives right after (re)connect still carries the
-                # PRE-command state and would revert the optimistic value in the UI while
-                # the command is still in flight. Skip values that contradict a recently
-                # sent, not-yet-confirmed command (see _should_suppress_stale).
-                if self._should_suppress_stale(key, value):
-                    continue
-                self._set_attribute_value(key, value)
+        now = time.monotonic()
+        for key, value in properties.items():
+            self._pushed_at[str(key)] = now
+            # A status snapshot that arrives right after (re)connect still carries the
+            # PRE-command state and would revert the optimistic value in the UI while
+            # the command is still in flight. Skip values that contradict a recently
+            # sent, not-yet-confirmed command (see _should_suppress_stale).
+            if self._should_suppress_stale(key, value):
+                continue
+            self._set_attribute_value(key, value)
         self.available = True
         self.write_ha_state()
 
@@ -1930,57 +2036,76 @@ class HaierDevice(object):
         if isinstance(payload, dict):
             self.sw_version = payload.get("swVersion") or self.sw_version
 
-    def _send_message(self, message: dict) -> bool:
-        return self._haier.send_message(json.dumps(message)) is not False
+    async def _send_message(self, message: dict) -> bool:
+        return (await self._haier.async_send_message(json.dumps(message))) is not False
 
-    def _send_commands(self, commands: list[dict], then: dict | None = None,
-                       on_reject: list[dict] | None = None) -> None:
-        self._send_group_command(commands, then=then, on_reject=on_reject)
+    async def _send_commands(self, commands: list[dict], then: dict | None = None,
+                             on_reject: list[dict] | None = None) -> None:
+        await self._send_group_command(commands, then=then, on_reject=on_reject)
 
-    def _send_group_command(self, commands: list[dict], attempt: int = 1, then: dict | None = None,
-                            on_reject: list[dict] | None = None) -> None:
+    async def _send_group_command(self, commands: list[dict], attempt: int = 1, then: dict | None = None,
+                                  on_reject: list[dict] | None = None, locked: bool = False) -> None:
         # on_reject: commands of the group sent once more on their own if the cloud rejects the
         # group (see HaierAC.switch_on); single commands are answered one by one and need none.
+        # locked: the caller holds _cmd_lock already (a resend).
         if not self.config.command_name:
             for i, c in enumerate(commands):
                 # A follow-up (then) waits for the last of them.
-                self._send_single_command(c, attempt, then if i == len(commands) - 1 else None)
+                await self._send_single_command(c, attempt, then if i == len(commands) - 1 else None, locked=locked)
             return
-        with self._cmd_lock:
-            trace = str(uuid.uuid4())
-            self._record_sent(commands, trace, attempt)
-            self._expect_ack(trace, commands, single=False, attempt=attempt, then=then, on_reject=on_reject)
-            sent = self._send_message({
-                "action": "operation",
-                "macAddress": self.device_id,
-                "commandName": self.config.command_name,
-                "commands": commands,
-                "trace": trace,
-            })
-            self._touch_sent(trace)
+        message = {
+            "action": "operation",
+            "macAddress": self.device_id,
+            "commandName": self.config.command_name,
+            "commands": commands,
+        }
+        await self._shielded(self._send_now(message, commands, False, attempt, then, on_reject, locked))
+
+    async def _send_single_command(self, command: dict, attempt: int = 1, then: dict | None = None,
+                                   locked: bool = False) -> None:
+        message = {
+            "action": "command",
+            "macAddress": self.device_id,
+            "command": command,
+        }
+        await self._shielded(self._send_now(message, [command], True, attempt, then, None, locked))
+
+    async def _shielded(self, coro: Coroutine) -> Any:
+        # Runs to the end even if the caller is cancelled (an automation in "restart" mode, a
+        # stopped script, a timeout): a command that was recorded must reach its ACK watchdog, as
+        # in the threaded versions, where the executor thread always completed it. Unloading the
+        # entry still cancels it (cancel_pending).
+        if self._stopped():
+            return await coro
+        return await asyncio.shield(self._create_task(coro, "command"))
+
+    async def _send_now(self, message: dict, commands: list[dict], single: bool, attempt: int,
+                        then: dict | None, on_reject: list[dict] | None, locked: bool) -> None:
+        if locked:
+            trace, sent = await self._record_and_send(message, commands, single, attempt, then, on_reject)
+        else:
+            async with self._cmd_lock:
+                trace, sent = await self._record_and_send(message, commands, single, attempt, then, on_reject)
         self._watch_ack(trace, sent)
 
-    def _send_single_command(self, command: dict, attempt: int = 1, then: dict | None = None) -> None:
-        with self._cmd_lock:
-            trace = str(uuid.uuid4())
-            self._record_sent([command], trace, attempt)
-            self._expect_ack(trace, [command], single=True, attempt=attempt, then=then)
-            sent = self._send_message({
-                "action": "command",
-                "macAddress": self.device_id,
-                "command": command,
-                "trace": trace,
-            })
-            self._touch_sent(trace)
-        self._watch_ack(trace, sent)
+    async def _record_and_send(self, message: dict, commands: list[dict], single: bool, attempt: int,
+                               then: dict | None, on_reject: list[dict] | None) -> tuple[str, bool]:
+        # Under _cmd_lock: recorded (for the stale-status guard and the ACK watchdog) before it
+        # goes out — the answer can arrive before the send returns.
+        trace = str(uuid.uuid4())
+        self._record_sent(commands, trace, attempt)
+        self._expect_ack(trace, commands, single=single, attempt=attempt, then=then, on_reject=on_reject)
+        sent = await self._send_message({**message, "trace": trace})
+        self._touch_sent(trace)
+        return trace, sent
 
-    def _send_followup(self, then: dict) -> None:
+    async def _send_followup(self, then: dict) -> None:
         # Commands that wait for another one's acknowledgement ("then", e.g. the mode after a
-        # power-on). Runs in its own thread, never in the WS thread.
+        # power-on). Runs as a task of its own, never inside the message handling.
         if not self._stopped():
-            self._send_commands(then["commands"])
+            await self._send_commands(then["commands"])
 
-    def _send_as_api_says(self, commands: list[dict]) -> None:
+    async def _send_as_api_says(self, commands: list[dict]) -> None:
         # All of them (not only the first), the way the API says the attributes accept writes:
         # operationType "G" — only inside the device's group command, "I"/"IG" — individually
         # too. Without that information single commands are used, as before.
@@ -1990,10 +2115,10 @@ class HaierDevice(object):
             operation = str((attr or {}).get("operationType") or "").upper()
             group_only |= bool(operation) and "I" not in operation
         if group_only and self.config.command_name:
-            self._send_group_command(commands)
+            await self._send_group_command(commands)
         else:
             for c in commands:
-                self._send_single_command(c)
+                await self._send_single_command(c)
 
     def _stopped(self) -> bool:
         try:
@@ -2010,39 +2135,44 @@ class HaierDevice(object):
     def _expect_ack(self, trace: str, commands: list[dict], single: bool, attempt: int,
                     then: dict | None = None, on_reject: list[dict] | None = None) -> None:
         # Registered before sending: the answer can arrive before _send_message returns.
-        with self._sent_lock:
-            self._awaiting_ack[trace] = {
-                "commands": commands, "single": single, "attempt": attempt,
-                "session": None, "sent": False, "extended": False, "then": then,
-                "on_reject": on_reject,
-            }
-            if then:
-                # The follow-up's values are shown at once: guard them against stale status
-                # updates like sent ones, under this trace (cleared if this command fails).
-                now = time.monotonic()
-                for c in then["commands"]:
-                    self._sent_commands[str(c.get("commandName"))] = {
-                        "value": self._norm_value(c.get("value")), "ts": now, "trace": trace,
-                    }
+        self._awaiting_ack[trace] = {
+            "commands": commands, "single": single, "attempt": attempt,
+            "session": None, "sent": False, "extended": False, "then": then,
+            "on_reject": on_reject,
+        }
+        if then:
+            # The follow-up's values are shown at once: guard them against stale status
+            # updates like sent ones, under this trace (cleared if this command fails).
+            now = time.monotonic()
+            for c in then["commands"]:
+                self._sent_commands[str(c.get("commandName"))] = {
+                    "value": self._norm_value(c.get("value")), "ts": now, "trace": trace,
+                }
 
     def _watch_ack(self, trace: str, sent: bool) -> None:
         # The timeout starts once the command is on the wire (sending may have included a
         # reconnect); "session" records which WS session it went into.
-        with self._sent_lock:
-            entry = self._awaiting_ack.get(trace)
-            if entry is None:
-                return  # already answered
-            entry["session"] = self._haier._connected_at
-            entry["sent"] = sent
+        entry = self._awaiting_ack.get(trace)
+        if entry is None:
+            return  # already answered
+        entry["session"] = self._haier._connected_at
+        entry["sent"] = sent
         self._start_ack_timer(trace)
 
     def _start_ack_timer(self, trace: str) -> None:
-        timer = threading.Timer(C.WS_CMD_ACK_TIMEOUT, self._on_ack_timeout, args=(trace,))
-        timer.daemon = True
-        timer.start()
+        if (old := self._ack_timers.pop(trace, None)) is not None:
+            old.cancel()
+        if self._stopped():
+            return  # the entry is unloaded: nothing would resend it
+        self._ack_timers[trace] = self.hass.loop.call_later(C.WS_CMD_ACK_TIMEOUT, self._on_ack_timeout, trace)
+
+    def _cancel_ack_timer(self, trace) -> None:
+        if (handle := self._ack_timers.pop(trace, None)) is not None:
+            handle.cancel()
 
     def _on_ack_timeout(self, trace: str) -> None:
-        # Runs in a timer thread.
+        # A timer callback in the event loop; what needs the network runs as a task.
+        self._ack_timers.pop(trace, None)
         try:
             haier = self._haier
             if haier.disconnect_requested:
@@ -2050,29 +2180,28 @@ class HaierDevice(object):
             current_session = haier._connected_at
         except ReferenceError:
             return  # the config entry was unloaded
-        with self._sent_lock:
-            entry = self._awaiting_ack.get(trace)
-            if entry is None:
-                return  # answered in the meantime
-            # Values the device has reported meanwhile (confirmed) or that a newer command
-            # replaced are not resent.
-            pending = [
-                c for c in entry["commands"]
-                if (self._sent_commands.get(str(c.get("commandName"))) or {}).get("trace") == trace
-            ]
-            # A session the cloud has not attached yet (nothing received since it opened)
-            # answers late — observed ~15s after a reconnect: give it one more period.
-            wait_more = bool(
-                pending
-                and entry["sent"]
-                and not entry["extended"]
-                and self._session_ready_at is None
-                and entry["session"] == current_session
-            )
-            if wait_more:
-                entry["extended"] = True
-            else:
-                self._awaiting_ack.pop(trace, None)
+        entry = self._awaiting_ack.get(trace)
+        if entry is None:
+            return  # answered in the meantime
+        # Values the device has reported meanwhile (confirmed) or that a newer command
+        # replaced are not resent.
+        pending = [
+            c for c in entry["commands"]
+            if (self._sent_commands.get(str(c.get("commandName"))) or {}).get("trace") == trace
+        ]
+        # A session the cloud has not attached yet (nothing received since it opened)
+        # answers late — observed ~15s after a reconnect: give it one more period.
+        wait_more = bool(
+            pending
+            and entry["sent"]
+            and not entry["extended"]
+            and self._session_ready_at is None
+            and entry["session"] == current_session
+        )
+        if wait_more:
+            entry["extended"] = True
+        else:
+            self._awaiting_ack.pop(trace, None)
         cmds = self._summarize(entry["commands"])
         if not pending:
             _LOGGER.info(
@@ -2109,7 +2238,7 @@ class HaierDevice(object):
                 f"{f' ({offline})' if offline else ''} — resending in a new websocket session"
             )
             haier.restart_session(entry["session"], f"a command to {self.device_name} got no answer")
-            self._resend(trace, entry)
+            self._create_task(self._resend(trace, entry), "resend")
             return
         silent = (
             "; nothing has been received over the websocket since the integration started"
@@ -2132,18 +2261,17 @@ class HaierDevice(object):
         # Commands of a rejected group worth sending again on their own (see HaierAC).
         return []
 
-    def _send_rest(self, commands: list[dict]) -> None:
+    async def _send_rest(self, commands: list[dict]) -> None:
         pass
 
-    def _resend(self, trace: str, entry: dict) -> None:
-        with self._cmd_lock:
+    async def _resend(self, trace: str, entry: dict) -> None:
+        async with self._cmd_lock:
             # Checked again under the send lock: a newer command for the same attribute sent
             # while the session was being restarted must not be overridden by this resend.
-            with self._sent_lock:
-                pending = [
-                    c for c in entry["commands"]
-                    if (self._sent_commands.get(str(c.get("commandName"))) or {}).get("trace") == trace
-                ]
+            pending = [
+                c for c in entry["commands"]
+                if (self._sent_commands.get(str(c.get("commandName"))) or {}).get("trace") == trace
+            ]
             if not pending:
                 _LOGGER.info(
                     f"CMD NO ACK [{self.device_name}] trace={trace}: newer commands replaced it "
@@ -2153,10 +2281,10 @@ class HaierDevice(object):
             then = entry.get("then")
             if entry["single"]:
                 for i, command in enumerate(pending):
-                    self._send_single_command(command, 2, then if i == len(pending) - 1 else None)
+                    await self._send_single_command(command, 2, then if i == len(pending) - 1 else None, locked=True)
             else:
                 on_reject = [c for c in entry.get("on_reject") or [] if c in pending] or None
-                self._send_group_command(pending, attempt=2, then=then, on_reject=on_reject)
+                await self._send_group_command(pending, attempt=2, then=then, on_reject=on_reject, locked=True)
 
     def _drop_followup(self, entry: dict | None) -> None:
         then = (entry or {}).get("then")
@@ -2195,11 +2323,10 @@ class HaierDevice(object):
 
     def _record_sent(self, commands: list[dict], trace: str, attempt: int = 1) -> None:
         now = time.monotonic()
-        with self._sent_lock:
-            for c in commands:
-                code = str(c.get("commandName"))
-                val = self._norm_value(c.get("value"))
-                self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
+        for c in commands:
+            code = str(c.get("commandName"))
+            val = self._norm_value(c.get("value"))
+            self._sent_commands[code] = {"value": val, "ts": now, "trace": trace}
         age = self._session_age()
         ready = (
             f"{now - self._session_ready_at:.2f}s ago"
@@ -2218,15 +2345,13 @@ class HaierDevice(object):
         # window would start counting from before the command was even on the wire, so a
         # slow reconnect could let the stale pre-command snapshot revert the value.
         now = time.monotonic()
-        with self._sent_lock:
-            for v in self._sent_commands.values():
-                if v["trace"] == trace:
-                    v["ts"] = now
+        for v in self._sent_commands.values():
+            if v["trace"] == trace:
+                v["ts"] = now
 
     def _ack_latency(self, trace) -> str:
         now = time.monotonic()
-        with self._sent_lock:
-            ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
+        ts = next((v["ts"] for v in self._sent_commands.values() if v["trace"] == trace), None)
         return f"{now - ts:.2f}s" if ts is not None else "n/a"
 
     @classmethod
@@ -2246,14 +2371,13 @@ class HaierDevice(object):
         # command we sent within WS_CMD_CORRELATION_WINDOW that the device has not yet
         # confirmed. Once the device reports the commanded value, the pending entry is
         # dropped and updates for that attribute flow normally again.
-        with self._sent_lock:
-            info = self._sent_commands.get(str(code))
-            if not info:
-                return False
-            dt = time.monotonic() - info["ts"]
-            if dt > C.WS_CMD_CORRELATION_WINDOW or self._values_equal(value, info["value"]):
-                self._sent_commands.pop(str(code), None)
-                return False
+        info = self._sent_commands.get(str(code))
+        if not info:
+            return False
+        dt = time.monotonic() - info["ts"]
+        if dt > C.WS_CMD_CORRELATION_WINDOW or self._values_equal(value, info["value"]):
+            self._sent_commands.pop(str(code), None)
+            return False
         _LOGGER.warning(
             f"STALE STATUS SUPPRESSED [{self.device_name}] code={code}: device reports "
             f"{self._norm_value(value)} but we sent {info['value']} {dt:.2f}s ago "
@@ -2264,16 +2388,14 @@ class HaierDevice(object):
     def _clear_sent_by_trace(self, trace) -> None:
         # After an explicit rejection the optimistic value is wrong — stop protecting it
         # so the follow-up refresh() can restore the real device state in the UI.
-        with self._sent_lock:
-            for code in [c for c, v in self._sent_commands.items() if v["trace"] == trace]:
-                self._sent_commands.pop(code, None)
+        for code in [c for c, v in self._sent_commands.items() if v["trace"] == trace]:
+            self._sent_commands.pop(code, None)
 
     def _log_state_correlation(self, properties: dict) -> None:
         if not properties:
             return
         now = time.monotonic()
-        with self._sent_lock:
-            snapshot = list(self._sent_commands.items())
+        snapshot = list(self._sent_commands.items())
         for code, info in snapshot:
             if code not in properties:
                 continue
@@ -2321,11 +2443,12 @@ class HaierDevice(object):
             # Surface rejections at WARNING so a dropped/refused command is easy to diagnose.
             err_no = message_dict.get("errNo", 0)
             trace = message_dict.get("trace")
-            with self._sent_lock:
-                if not trace and self._awaiting_ack:
-                    # An answer without a trace can only be for the oldest unanswered command.
-                    trace = next(iter(self._awaiting_ack))
-                entry = self._awaiting_ack.pop(trace, None)
+            if not trace and self._awaiting_ack:
+                # An answer without a trace can only be for the oldest unanswered command.
+                trace = next(iter(self._awaiting_ack))
+            entry = self._awaiting_ack.pop(trace, None)
+            if entry is not None:
+                self._cancel_ack_timer(trace)
             latency = self._ack_latency(trace)
             if err_no not in (0, "0", None):
                 cmds = self._summarize(entry["commands"]) if entry else "?"
@@ -2338,7 +2461,7 @@ class HaierDevice(object):
                 self._drop_followup(entry)
                 self._clear_sent_by_trace(trace)
                 if entry and (rest := self._rejected_rest(entry)):
-                    threading.Thread(target=self._send_rest, args=(rest,), daemon=True).start()
+                    self._create_task(self._send_rest(rest), "resend the rest of a rejected command")
                 else:
                     self._schedule_refresh_after_failure()
             else:
@@ -2346,7 +2469,7 @@ class HaierDevice(object):
                     f"CMD ACK [{self.device_name}] trace={trace} errNo=0 latency={latency}"
                 )
                 if (entry or {}).get("then"):
-                    threading.Thread(target=self._send_followup, args=(entry["then"],), daemon=True).start()
+                    self._create_task(self._send_followup(entry["then"]), "follow-up")
         elif message_type == "info":
             self._handle_info(message_dict)
         elif message_type == "deviceStatusEvent":
@@ -2382,9 +2505,14 @@ class HaierDevice(object):
         _LOGGER.info(f"{self.device_name}: program event {received_message.get('data')}")
 
     def write_ha_state(self) -> None:
-        # A copy: entities (un)subscribe from the event loop while this runs in worker threads.
+        # In the event loop (the entities' async_write_ha_state); a copy: an entity may
+        # unsubscribe while this runs. One entity failing (e.g. a value its class refuses) must
+        # not cost the others their update, nor fail the command or the update that wrote it.
         for callback in list(self._write_ha_state_callbacks):
-            self.hass.loop.call_soon_threadsafe(callback)
+            try:
+                callback()
+            except Exception:
+                _LOGGER.exception(f"Failed to write the state of an entity of {self.device_name}")
 
     def add_write_ha_state_callback(self, callback) -> Callable[[], None]:
         # Returns the unsubscribe function, for Entity.async_on_remove().
@@ -2418,7 +2546,7 @@ class HaierDevice(object):
         return []
 
     @classmethod
-    def create(
+    async def async_create(
         cls,
         haier: Haier,
         device_type: str,
@@ -2426,9 +2554,10 @@ class HaierDevice(object):
         device_serial: str = None,
         device_title: str = None,
     ) -> HaierDevice:
-        backend_data = haier.pull_device_data(device_mac)
+        backend_data = await haier.async_pull_device_data(device_mac)
         if not cls.valid_status(backend_data):
             raise ValueError(f"unexpected device config payload: {str(backend_data)[:200]}")
+        await cls.async_preload_config(haier.hass, backend_data)
         device_cls = {
             "AC": HaierAC,
             "REF": HaierREF,
@@ -2666,10 +2795,10 @@ class HaierAC(HaierDevice):
         # sent here to force that snapshot — but any operation command makes the AC beep,
         # the cloud occasionally rejects it (errNo=-1), and the snapshot arrives (or not)
         # regardless of it. So: just wait, and fall back to a silent REST refresh.
-        threading.Thread(target=self._init_snapshot_fallback, daemon=True).start()
+        self._create_task(self._init_snapshot_fallback(), "snapshot fallback")
 
-    def _init_snapshot_fallback(self) -> None:
-        time.sleep(C.WS_INIT_SNAPSHOT_TIMEOUT)
+    async def _init_snapshot_fallback(self) -> None:
+        await asyncio.sleep(C.WS_INIT_SNAPSHOT_TIMEOUT)
         if self._snapshot_seen or self._stopped():
             return
         _LOGGER.info(
@@ -2677,7 +2806,9 @@ class HaierAC(HaierDevice):
             f"for {self.device_name} — refreshing over REST instead"
         )
         try:
-            self.refresh()
+            await self.async_refresh()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _LOGGER.warning(
                 f"Failed to refresh {self.device_name} after missing snapshot: {e}"
@@ -2762,12 +2893,12 @@ class HaierAC(HaierDevice):
     def get_eco_sensor_options(self) -> list[str]:
         return self.config.get_values('eco_sensor')
 
-    def set_temperature(self, value: float, hvac_mode: str | None = None) -> None:
+    async def set_temperature(self, value: float, hvac_mode: str | None = None) -> None:
         command = [{"commandName": self.config['target_temperature'], "value": number_text(value)}]
         if hvac_mode == HVACMode.OFF:
-            self.switch_off()  # the target is read-only while off (API modifiers): not sent
+            await self.switch_off()  # the target is read-only while off (API modifiers): not sent
         elif hvac_mode:
-            self.switch_on(hvac_mode, extra=command)
+            await self.switch_on(hvac_mode, extra=command)
         elif self.status == 0 and self._writable(command, {"target_temperature"})[1]:
             # Off, and the cloud keeps the setpoint read-only until the unit runs: Alice and
             # thermostat cards may set the temperature first ("включи на 24"). Shown at once and
@@ -2778,7 +2909,7 @@ class HaierAC(HaierDevice):
             self.write_ha_state()
         else:
             self._deferred_temperature = None
-            self._command(command, {"target_temperature"}, user=True)
+            await self._command(command, {"target_temperature"}, user=True)
 
     def _get_status_commands(self, turn_on: bool) -> list[dict]:
         # Power on/off command, with a guaranteed numeric fallback. The value is normally
@@ -2800,7 +2931,7 @@ class HaierAC(HaierDevice):
                 }])
         return cmds
 
-    def switch_on(self, value: str = None, extra: list[dict] | None = None) -> None:
+    async def switch_on(self, value: str = None, extra: list[dict] | None = None) -> None:
         # value: the HVAC mode to run in; None (or a mode the device does not have) keeps the
         # device's own mode. extra: commands that need the AC on (e.g. a new target).
         modes = [m for m in self.get_hvac_modes() if m != HVACMode.OFF]
@@ -2832,17 +2963,17 @@ class HaierAC(HaierDevice):
             # While the AC is off it declares mode, temperature, fan and presets read-only (API
             # modifiers), and the Evo app turns it on with the power command alone: send that
             # first, the rest once the cloud has acknowledged it.
-            self._command(power, {"status"}, then={"commands": follow, "names": names})
+            await self._command(power, {"status"}, then={"commands": follow, "names": names})
         else:
             # Always send status=on (do not skip on a cached self.status): the cached value can
             # be stale after an optimistic update or a lost command. Believed on: should the cloud
             # refuse "power on" for the running unit together with the rest (errNo 22), the mode
             # and setpoint go out once more alone (on_reject).
-            self._command(power + follow, {"status"} | names,
+            await self._command(power + follow, {"status"} | names,
                           on_reject=follow if self.status == 1 else None)
 
-    def switch_off(self) -> None:
-        self._command(self._get_status_commands(turn_on=False), {"status"})
+    async def switch_off(self) -> None:
+        await self._command(self._get_status_commands(turn_on=False), {"status"})
 
     def _rejected_rest(self, entry: dict) -> list[dict]:
         # The cloud may refuse "power on" for a unit that runs already (errNo 22), and the rest of
@@ -2852,22 +2983,22 @@ class HaierAC(HaierDevice):
         # and without the cloud's power-on side commands — is sent once more on its own.
         return list(entry.get("on_reject") or [])
 
-    def _send_rest(self, commands: list[dict]) -> None:
+    async def _send_rest(self, commands: list[dict]) -> None:
         # Runs in its own thread (not the WS thread, which delivers the answers).
         if self._stopped():
             return
         _LOGGER.info(f"{self.device_name}: power on refused for a running unit, sending the rest alone")
         try:
-            self._command(commands, set())  # checked when they went out first
+            await self._command(commands, set())  # checked when they went out first
         except Exception as e:
             _LOGGER.warning(f"{self.device_name}: failed to send the rest of a refused command: {e}")
             self._schedule_refresh_after_failure()
 
-    def _send_followup(self, then: dict) -> None:
+    async def _send_followup(self, then: dict) -> None:
         if not self._stopped():
-            self._command(then["commands"], then["names"])
+            await self._command(then["commands"], then["names"])
 
-    def _command(self, commands: list[dict], names: set[str], then: dict | None = None,
+    async def _command(self, commands: list[dict], names: set[str], then: dict | None = None,
                  user: bool = False, on_reject: list[dict] | None = None) -> list[dict]:
         # Sends what the device accepts in its current state and shows the result at once —
         # including the side commands the API constraints add (a mode change that also resets
@@ -2887,15 +3018,19 @@ class HaierAC(HaierDevice):
                 )
         if allowed:
             on_reject = [c for c in on_reject or [] if c in allowed] or None
-            self._send_commands(allowed, then=then, on_reject=on_reject)
-            self._apply_optimistic(allowed + (then["commands"] if then else []))
+            await self._shielded(self._send_and_show(allowed, then, on_reject))
         self.write_ha_state()
         return allowed
 
+    async def _send_and_show(self, allowed: list[dict], then: dict | None, on_reject: list[dict] | None) -> None:
+        # The command and the state it shows go together, even if the caller is cancelled.
+        await self._send_commands(allowed, then=then, on_reject=on_reject)
+        self._apply_optimistic(allowed + (then["commands"] if then else []))
+        self.write_ha_state()
+
     def _apply_optimistic(self, commands: list[dict]) -> None:
-        with self._lock:
-            for c in commands:
-                self._set_attribute_value(str(c.get("commandName")), c.get("value"))
+        for c in commands:
+            self._set_attribute_value(str(c.get("commandName")), c.get("value"))
 
     def _restrictions(self) -> tuple[dict[str, str], dict[str, set[str]]]:
         # Attributes the API modifiers make read-only, and value ranges they impose, right now.
@@ -2923,57 +3058,57 @@ class HaierAC(HaierDevice):
                 allowed.append(c)
         return allowed, refused
 
-    def _set(self, name: str, value) -> None:
+    async def _set(self, name: str, value) -> None:
         if commands := self.get_commands(name, value):
-            self._command(commands, {name}, user=True)
+            await self._command(commands, {name}, user=True)
 
-    def set_fan_mode(self, value: str) -> None:
-        self._set("fan_mode", value)
+    async def set_fan_mode(self, value: str) -> None:
+        await self._set("fan_mode", value)
 
-    def set_swing_horizontal_mode(self, value: str) -> None:
-        self._set("swing_horizontal_mode", value)
+    async def set_swing_horizontal_mode(self, value: str) -> None:
+        await self._set("swing_horizontal_mode", value)
 
-    def set_swing_mode(self, value: str) -> None:
-        self._set("swing_mode", value)
+    async def set_swing_mode(self, value: str) -> None:
+        await self._set("swing_mode", value)
 
-    def set_preset_mode(self, value: str) -> None:
+    async def set_preset_mode(self, value: str) -> None:
         if commands := self.get_commands("preset_mode", value):
             names = {a.name for a in self.config.attrs if a.name.startswith("preset_mode_")}
-            if self._command(commands, names, user=True):
+            if await self._command(commands, names, user=True):
                 # none/sleep/boost are then derived from quiet/turbo; a custom preset of the
                 # model YAML is kept as is
                 self.preset_mode = value
                 self.write_ha_state()
 
-    def set_light_on(self, value: bool) -> None:
-        self._set("light", value)
+    async def set_light_on(self, value: bool) -> None:
+        await self._set("light", value)
 
-    def set_sound_on(self, value: bool) -> None:
-        self._set("sound", value)
+    async def set_sound_on(self, value: bool) -> None:
+        await self._set("sound", value)
 
-    def set_quiet_on(self, value: bool) -> None:
-        self._set("quiet", value)
+    async def set_quiet_on(self, value: bool) -> None:
+        await self._set("quiet", value)
 
-    def set_health_on(self, value: bool) -> None:
-        self._set("health", value)
+    async def set_health_on(self, value: bool) -> None:
+        await self._set("health", value)
 
-    def set_turbo_on(self, value: bool) -> None:
-        self._set("turbo", value)
+    async def set_turbo_on(self, value: bool) -> None:
+        await self._set("turbo", value)
 
-    def set_comfort_on(self, value: bool) -> None:
-        self._set("comfort", value)
+    async def set_comfort_on(self, value: bool) -> None:
+        await self._set("comfort", value)
 
-    def set_cleaning_on(self, value: bool) -> None:
-        self._set("cleaning", value)
+    async def set_cleaning_on(self, value: bool) -> None:
+        await self._set("cleaning", value)
 
-    def set_antifreeze_on(self, value: bool) -> None:
-        self._set("antifreeze", value)
+    async def set_antifreeze_on(self, value: bool) -> None:
+        await self._set("antifreeze", value)
 
-    def set_autohumidity_on(self, value: bool) -> None:
-        self._set("autohumidity", value)
+    async def set_autohumidity_on(self, value: bool) -> None:
+        await self._set("autohumidity", value)
 
-    def set_eco_sensor(self, value: str) -> None:
-        self._set("eco_sensor", value)
+    async def set_eco_sensor(self, value: str) -> None:
+        await self._set("eco_sensor", value)
 
     def create_entities_climate(self) -> list:
         from . import climate
@@ -3113,39 +3248,39 @@ class HaierREF(HaierDevice):
     def get_my_zone_options(self) -> list[str]:
         return self.config.get_values('my_zone')
 
-    def set_super_cooling(self, value: bool) -> None:
+    async def set_super_cooling(self, value: bool) -> None:
         if commands := self.get_commands("super_cooling", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.super_cooling = value
             self.write_ha_state()
 
-    def set_super_freeze(self, value: bool) -> None:
+    async def set_super_freeze(self, value: bool) -> None:
         if commands := self.get_commands("super_freeze", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.super_freeze = value
             self.write_ha_state()
 
-    def set_vacation_mode(self, value: bool) -> None:
+    async def set_vacation_mode(self, value: bool) -> None:
         if commands := self.get_commands("vacation_mode", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.vacation_mode = value
             self.write_ha_state()
 
-    def set_fridge_mode(self, value: str) -> None:
+    async def set_fridge_mode(self, value: str) -> None:
         if commands := self.get_commands("fridge_mode", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.fridge_mode = value
             self.write_ha_state()
 
-    def set_freezer_mode(self, value: str) -> None:
+    async def set_freezer_mode(self, value: str) -> None:
         if commands := self.get_commands("freezer_mode", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.freezer_mode = value
             self.write_ha_state()
 
-    def set_my_zone(self, value: str) -> None:
+    async def set_my_zone(self, value: str) -> None:
         if commands := self.get_commands("my_zone", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.my_zone = value
             self.write_ha_state()
 
@@ -3334,9 +3469,9 @@ class HaierWM(HaierDevice):
         if self._cycle_codes() & {str(code) for code in properties}:
             self._cycle_seen_at = time.monotonic()
 
-    def refresh(self) -> None:
+    async def async_refresh(self) -> None:
         requested_at = time.monotonic()
-        super().refresh()
+        await super().async_refresh()
         self._cycle_seen_at = max(self._cycle_seen_at, requested_at)
 
     def _resend_allowed(self, commands: list[dict]) -> bool:
@@ -3374,12 +3509,12 @@ class HaierWM(HaierDevice):
         if self.link_status == "GOOD" and previous not in (None, "GOOD"):
             self._poll_requested = True
 
-    def poll(self) -> None:
-        # One read of the active polling (Haier.poll_active_laundry).
+    async def async_poll(self) -> None:
+        # One read of the active polling (Haier.async_poll_active_laundry).
         self._polled_at = time.monotonic()
         self._poll_requested = False
         before = (self.status, self.program, self.phase, self.remaining_time)
-        self.refresh()
+        await self.async_refresh()
         after = (self.status, self.program, self.phase, self.remaining_time)
         if after != before:
             _LOGGER.debug(
@@ -3654,12 +3789,12 @@ class HaierWM(HaierDevice):
     def get_spin_speed_options(self) -> list[str]:
         return self.config.get_values('spin_speed')
 
-    def set_program(self, value: str) -> None:
+    async def set_program(self, value: str) -> None:
         self._ensure_remote_control()
         program = next((p for p in self.programs if p["name"] == value), None)
         if program is not None:
             if program["commands"]:
-                self._send_commands(program["commands"])
+                await self._send_commands(program["commands"])
                 self.program = value
                 # Keep the codes in step, so a status update that arrives before the device
                 # echoes the new program does not switch the select back (_update_program).
@@ -3668,21 +3803,21 @@ class HaierWM(HaierDevice):
             return
         # fallback: a single attribute from YAML
         if commands := self.get_commands("program", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.program = value
             self.write_ha_state()
 
-    def set_temperature(self, value: str) -> None:
+    async def set_temperature(self, value: str) -> None:
         self._ensure_remote_control()
         if commands := self.get_commands("temperature", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.temperature = value
             self.write_ha_state()
 
-    def set_spin_speed(self, value: str) -> None:
+    async def set_spin_speed(self, value: str) -> None:
         self._ensure_remote_control()
         if commands := self.get_commands("spin_speed", value):
-            self._send_as_api_says(commands)
+            await self._send_as_api_says(commands)
             self.spin_speed = value
             self.write_ha_state()
 

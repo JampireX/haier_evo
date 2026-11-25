@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import hashlib
 import json
 import re
@@ -15,6 +16,23 @@ _KNOWN_VERSIONS: dict[str, set[str]] | None = None
 _REPORTED_COPIES: set[str] = set()
 # A model name (from the cloud) that may become a part of a file name: <config>/haier_evo.<model>.yaml.
 SAFE_MODEL = re.compile(r"[A-Za-z0-9()_.-]{1,32}")
+# (model, user path) -> the device description read by async_preload (in the executor): the
+# configs built in the event loop take a copy of it instead of reading files there.
+_PRELOADED: dict[tuple[str, str], dict] = {}
+
+
+async def async_preload(hass, model: str, userpath: str) -> None:
+    """Find, copy and read the description of a model in the executor (file work must not run
+    in the event loop). Read again on every call: edits of the user copy apply at the next
+    refresh, as they did when every config read its file."""
+    _PRELOADED[(model, userpath)] = await hass.async_add_executor_job(_read_device_config, model, userpath)
+
+
+def _read_device_config(model: str, userpath: str) -> dict:
+    # Blocking: the executor.
+    config = HaierDeviceConfig.__new__(HaierDeviceConfig)
+    config._model, config._userpath = model, userpath
+    return config._read_config_file()
 
 
 def _known_versions(name: str) -> set[str]:
@@ -151,17 +169,25 @@ class HaierDeviceConfig(object):
         return user
 
     def _load_config_file(self) -> None:
+        preloaded = _PRELOADED.get((self._model, self._userpath))
+        if preloaded is not None:
+            # A copy: the configs adopt and change the attributes built from it.
+            self._config = copy.deepcopy(preloaded)
+            return
+        # Not preloaded (a caller outside the event loop): read it here.
+        self._config = self._read_config_file()
+
+    def _read_config_file(self) -> dict:
         fname = self._find_config_file()
         try:
             config = load_yaml(fname) or {}
             if not isinstance(config, dict):
                 raise ValueError(f"expected a mapping at the top level, got {type(config).__name__}")
-            self._config = config
         except Exception as e:
             _LOGGER.error(f"Failed to load config {fname}: {e}")
-            self._config = {}
-        else:
-            _LOGGER.debug("Loaded device config %s", fname)
+            return {}
+        _LOGGER.debug("Loaded device config %s", fname)
+        return config
 
     def to_dict(self) -> dict:
         return {

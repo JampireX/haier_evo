@@ -13,24 +13,20 @@ REFRESH_LIMIT_429 = 60
 REFRESH_LIMIT_500 = 60
 API_HTTP_ROUTE = True
 API_TIMEOUT = 15
-# WebSocket keepalive. A ping is sent every WS_PING_INTERVAL seconds; if no pong is
-# received within WS_PING_TIMEOUT seconds the connection is treated as dead and torn
-# down so the background thread can reconnect. Without a ping timeout a half-open
-# (silently dead) connection is never detected, and the first command after a long
-# idle is buffered into the dead socket and lost. WS_PING_TIMEOUT must be < WS_PING_INTERVAL.
+# WebSocket keepalive (aiohttp's heartbeat): a ping every WS_PING_INTERVAL seconds; no pong within
+# half of it (5 s) closes the connection, and the connection loop opens a new one. Without it a
+# half-open (silently dead) connection is never detected, and the first command after a long idle
+# is buffered into the dead socket and lost.
 WS_PING_INTERVAL = 10
-WS_PING_TIMEOUT = 5
-# Seconds a websocket connection attempt has for its TLS handshake and its HTTP upgrade (also the
-# socket timeout of the open session). websocket-client sets none: a server that accepted the TCP
-# connection and never answered would keep the WS thread connecting for good (commands failing
-# with «Socket not ready» until a reload of the integration).
+# Seconds a websocket connection attempt has in all: TCP connect, TLS handshake, HTTP upgrade.
+# aiohttp sets no limit of its own there: a server that accepted the TCP connection and never
+# answered would keep the loop connecting for good (commands failing with «Socket not ready»
+# until a reload of the integration). (The threaded versions also gave the TCP connect alone
+# about 7 s; an unanswered SYN costs up to this many seconds now.)
 WS_CONNECT_TIMEOUT = 30
-# SYN retransmissions of the websocket's TCP connect before it gives up (Linux TCP_SYNCNT; other
-# systems keep their default). The kernel default (6) waits about 2 min: in a user's log a
-# reconnect hung 135 s on an unanswered SYN while a new connection went through at once. 2 gives
-# up after about 7 s (1 + 2 + 4 s of retransmission timeouts), then connect() makes the next
-# attempt.
-WS_CONNECT_SYN_RETRIES = 2
+# Seconds the closing of a websocket waits for the cloud's answer to the close frame (an unload
+# or a dropped session does not wait for a cloud that does not answer).
+WS_CLOSE_TIMEOUT = 1.0
 # After a successful send() we wait this long and re-check the socket: a half-open
 # connection can close a few ms after send() returned (no exception raised), silently
 # losing the command. If the socket is down by then we raise to trigger the retry/resend.
@@ -66,6 +62,7 @@ WS_SILENT_SESSIONS_FRESH_TOKEN = 2
 # seconds (on top of the 5 s connect rate limit). Sessions dropped for silence count too;
 # sessions we end ourselves for other reasons do not.
 WS_RECONNECT_BACKOFF_MAX = 300
+WS_RECONNECT_BACKOFF_MIN = 5
 WS_SESSION_OK_AFTER = 60
 # A REST path that answers 401 even with a freshly refreshed token is not refused because of the
 # token: for this many seconds its 401s no longer force a token refresh and a websocket restart.

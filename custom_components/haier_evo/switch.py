@@ -100,20 +100,14 @@ class HaierSwitch(SwitchEntity):
         return self._device.available
 
     async def async_turn_on(self, **kwargs):
-        await self.hass.async_add_executor_job(self.turn_on)
-
-    def turn_on(self) -> None:
         method = getattr(self._device, f"set_{self._device_attr_name}", None)
         if method is not None:
-            method(True)
+            await method(True)
 
     async def async_turn_off(self, **kwargs):
-        await self.hass.async_add_executor_job(self.turn_off)
-
-    def turn_off(self, **kwargs) -> None:
         method = getattr(self._device, f"set_{self._device_attr_name}", None)
         if method is not None:
-            method(False)
+            await method(False)
 
     @property
     def is_on(self) -> bool:

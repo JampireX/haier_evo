@@ -3,8 +3,6 @@ import re
 import time
 from pathlib import Path
 from datetime import timedelta
-from requests.exceptions import RequestException
-from tenacity import RetryError
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
@@ -51,8 +49,7 @@ def _is_rate_limited(exc: BaseException | None) -> bool:
     for _ in range(10):  # walk the cause/context chain (bounded: it can be cyclic)
         if exc is None:
             return False
-        response = getattr(exc, "response", None)
-        if isinstance(exc, api.ManyRequestsError) or getattr(response, "status_code", None) == 429:
+        if isinstance(exc, api.ManyRequestsError) or getattr(exc, "status", None) == 429:
             return True
         exc = exc.__cause__ or exc.__context__
     return False
@@ -93,10 +90,10 @@ def _check_complete(hass: HomeAssistant, entry: ConfigEntry, haier_object: api.H
 
 
 async def _async_stop(hass: HomeAssistant, haier_object: api.Haier) -> None:
-    # stop() ends the websocket session: keep that socket work off the event loop. A failure
-    # here must not mask the setup error being raised or fail the unload.
+    # Ends the websocket session and the object's tasks. A failure here must not mask the setup
+    # error being raised or fail the unload.
     try:
-        await hass.async_add_executor_job(haier_object.stop)
+        await haier_object.async_stop()
     except Exception as e:
         _LOGGER.warning(f"Error stopping {haier_object!r}: {e!r}")
 
@@ -124,8 +121,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     region = entry.data.get("region") or "ru"
     haier_object = api.Haier(hass, username, password, region, entry_id=entry.entry_id)
     try:
-        await hass.async_add_executor_job(haier_object.load_tokens)
-        await hass.async_add_executor_job(haier_object.pull_data)
+        await haier_object.async_load_tokens()
+        await haier_object.async_pull_data()
         if haier_object.no_devices_listed and dr.async_entries_for_config_entry(
             dr.async_get(hass), entry.entry_id
         ):
@@ -139,7 +136,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _async_stop(hass, haier_object)
         if isinstance(e, api.InvalidCredentials):
             raise ConfigEntryAuthFailed(str(e)) from e
-        if not isinstance(e, (api.InvalidAuth, api.InvalidDevicesList, RequestException, RetryError)):
+        if not isinstance(e, (api.InvalidAuth, api.InvalidDevicesList, api.HaierHTTPError, api.HaierConnectionError)):
             raise
         # A network/cloud failure (no connectivity at boot, timeout, 429, 5xx) is transient:
         # let HA retry the setup instead of leaving the entry in a permanent setup error.
@@ -150,28 +147,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _SETUP_BACKOFF.pop(entry.entry_id, None)
     # Credentials rejected later (e.g. the password was changed in the app and the tokens
     # were revoked) start HA's re-auth flow instead of the integration silently stopping.
-    haier_object.on_auth_failed = lambda: hass.loop.call_soon_threadsafe(
-        entry.async_start_reauth, hass
-    )
+    haier_object.on_auth_failed = lambda: entry.async_start_reauth(hass)
     entry.runtime_data = haier_object
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Background heartbeat: reconnect a stale/zombie WS session and re-pull state over REST,
     # so devices the user only observes (e.g. an idle washing machine) keep updating instead
-    # of silently freezing. Runs off the event loop; auto-cancelled on unload.
+    # of silently freezing. Auto-cancelled on unload.
     async def _heartbeat(now) -> None:
-        await hass.async_add_executor_job(haier_object.heartbeat)
+        await haier_object.async_heartbeat()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _heartbeat, timedelta(seconds=WS_HEARTBEAT_INTERVAL))
     )
 
     # A washing machine that is on is re-read over REST every ~15 s: the cloud pushes the phase
-    # and the remaining time of a wash only every few minutes (see Haier.poll_active_laundry).
-    # The check itself is cheap and stays on the event loop while every machine is off.
+    # and the remaining time of a wash only every few minutes (see
+    # Haier.async_poll_active_laundry). The check itself is cheap.
     async def _poll_laundry(now) -> None:
         if haier_object.wants_laundry_poll():
-            await hass.async_add_executor_job(haier_object.poll_active_laundry)
+            await haier_object.async_poll_active_laundry()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _poll_laundry, timedelta(seconds=WM_ACTIVE_POLL_TICK))

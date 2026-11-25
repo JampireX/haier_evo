@@ -1,70 +1,68 @@
+from __future__ import annotations
 
+import asyncio
 import time
 from functools import wraps
-from ratelimit.decorators import RateLimitDecorator
-from ratelimit.exception import RateLimitException
 
 
-class ResettableLimits(RateLimitDecorator):
+class ResettableLimits:
+    """At most `calls` calls per `period` seconds, for coroutines (asyncio).
 
-    def __init__(self, **kwargs) -> None:
-        self._multiplier = kwargs.pop("multiplier", 1)
-        self._max = kwargs.pop("max", kwargs.get("period"))
-        self._exp_base = kwargs.pop("exp_base", 2)
-        super().__init__(**kwargs)
-        self._init_period = self.period
-        self._min = self.period
-        self._counter = 0
-        self._RateLimitDecorator__period_remaining = self.__period_remaining
-        self._reset = False
+    The semantics of the ratelimit-based limiter of the threaded versions (0.3.x up to 0.3.28):
+    a fixed window opens with the first call after the previous one has passed; a call beyond
+    `calls` in the window waits for its end. `add_period` lengthens the window (backoff after a
+    429 / 5xx, up to `max`), `set_period` restores it, `reset` clears the window and wakes the
+    calls waiting in it. Instances are shared by all config entries (one source IP).
+    """
 
-    def set_period(self, period: int | float = None):
+    # How often a waiting call checks for a reset (it wakes within this many seconds).
+    _POLL = 0.5
+
+    def __init__(self, calls: int = 15, period: float = 900, max: float | None = None) -> None:  # noqa: A002
+        self.calls = calls
+        self.period = self._init_period = period
+        self._max = max if max is not None else period
+        self.num_calls = 0
+        self.last_reset = self.clock()
+        self._generation = 0
+
+    @staticmethod
+    def clock() -> float:
+        return time.monotonic()
+
+    def _remaining(self) -> float:
+        return self.period - (self.clock() - self.last_reset)
+
+    async def acquire(self) -> None:
+        while True:
+            remaining = self._remaining()
+            if remaining <= 0:
+                self.num_calls = 0
+                self.last_reset = self.clock()
+            if self.num_calls < self.calls:
+                self.num_calls += 1
+                return
+            generation = self._generation
+            deadline = self.clock() + remaining
+            while self._generation == generation and (left := deadline - self.clock()) > 0:
+                await asyncio.sleep(min(left, self._POLL))
+
+    def __call__(self, func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            await self.acquire()
+            return await func(*args, **kwargs)
+        return wrapper
+
+    def set_period(self, period: float | None = None) -> None:
         self.period = period or self._init_period
 
-    def add_period(self, period: int | float = None) -> float | int:
-        period = self.period + period
-        self.period = min(period, self._max)
-        return self.period
-
-    def expand_period(self) -> float | int:
-        try:
-            exp = self._exp_base ** (self._counter - 1)
-            result = self._multiplier * exp
-        except OverflowError:
-            result = self._max
-        else:
-            result = max(max(0, self._min), min(result, self._max))
-        self.period = result
+    def add_period(self, period: float) -> float:
+        self.period = min(self.period + period, self._max)
         return self.period
 
     def reset(self) -> None:
         self.period = self._init_period
         self.num_calls = 0
         self.last_reset = self.clock()
-        self._counter = 0
-        self._reset = True
-
-    def __period_remaining(self) -> float:
-        self._counter += 1
-        self._reset = False
-        elapsed = self.clock() - self.last_reset
-        return self.period - elapsed
-
-    def sleep_and_retry(self, func):
-        @wraps(func)
-        def wrapper(*args, **kargs):
-            while True:
-                try:
-                    return func(*args, **kargs)
-                except RateLimitException as exception:
-                    self._sleep(exception.period_remaining)
-        return wrapper
-
-    def _sleep(self, period_remaining) -> None:
-        now = self.clock()
-        while not self._reset:
-            elapsed = self.clock() - now
-            if elapsed >= period_remaining:
-                break
-            time.sleep(0.01)
-        self._reset = False
+        self._generation += 1

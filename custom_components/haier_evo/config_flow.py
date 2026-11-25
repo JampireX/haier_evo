@@ -1,11 +1,13 @@
 from __future__ import annotations
-import requests
+import asyncio
 import voluptuous as vol
 from typing import Any
 from urllib.parse import urljoin
+from aiohttp import ClientError
 from homeassistant import config_entries, exceptions
 from homeassistant.core import HomeAssistant
 from homeassistant.core import callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from . import api
 from . import const as C
 from .const import DOMAIN
@@ -51,8 +53,8 @@ def _title(data: dict) -> str:
     return f'{data["email"]} ({data["region"]})'
 
 
-def sign_in(email: str, password: str, region: str) -> None:
-    """One sign-in attempt against the Evo cloud (blocking: run it in the executor).
+async def async_sign_in(hass: HomeAssistant, email: str, password: str, region: str) -> None:
+    """One sign-in attempt against the Evo cloud.
 
     Sends the request api.Haier.auth_login sends through make_request. The tokens it returns
     are discarded: the integration signs in by itself when the entry is (re)loaded.
@@ -60,13 +62,14 @@ def sign_in(email: str, password: str, region: str) -> None:
     """
     url = urljoin(C.API_PATH, C.API_LOGIN.format(region=region))
     try:
-        response = requests.post(
+        async with async_get_clientsession(hass).post(
             url,
             data={"email": email, "password": password},
             headers={"User-Agent": "evo-mobile", "Platform": "android", "Accept": "*/*"},
-            timeout=C.API_TIMEOUT,
+            timeout=api._HTTP_TIMEOUT,
             allow_redirects=False,  # a redirect would re-post the password elsewhere
-        )
+        ) as resp:
+            response = api._Response(resp.status, resp.headers, await resp.read(), url)
         if response.status_code == 429:
             raise CannotConnect("429 Too Many Requests")
         api.refuse_redirect(response)
@@ -79,9 +82,12 @@ def sign_in(email: str, password: str, region: str) -> None:
         raise InvalidAuth(str(e)) from e
     except CannotConnect:
         raise
-    except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
+    except asyncio.CancelledError:
+        raise
+    except (ClientError, TimeoutError, OSError, api.HaierHTTPError, api.HaierConnectionError,
+            ValueError, TypeError, AttributeError) as e:
         # Network errors, timeouts, HTTP errors, an error answer from the cloud (AuthError and
-        # its subclasses are HTTPErrors) or a response that is not the expected JSON.
+        # its subclasses are HaierHTTPErrors) or a response that is not the expected JSON.
         raise CannotConnect(f"{type(e).__name__}: {e}") from e
 
 
@@ -92,7 +98,7 @@ async def validate_input(hass: HomeAssistant, data: dict) -> dict[str, Any]:
         raise InvalidPassword
     if data["region"] not in REGIONS:
         raise InvalidRegion
-    await hass.async_add_executor_job(sign_in, data["email"], data["password"], data["region"])
+    await async_sign_in(hass, data["email"], data["password"], data["region"])
     return {"title": _title(data)}
 
 
