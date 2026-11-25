@@ -9,6 +9,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/JampireX/haier_evo/issues",
   "requirements": [],
-  "version": "0.4.1",
+  "version": "0.5.0",
   "zeroconf": []
 }

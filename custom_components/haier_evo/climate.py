@@ -32,8 +32,6 @@ class HaierACEntity(ClimateEntity):
         self._attr_hvac_modes = device.get_hvac_modes()
         self._attr_swing_horizontal_modes = device.get_swing_horizontal_modes()
         self._attr_swing_modes = device.get_swing_modes()
-        # https://developers.home-assistant.io/blog/2024/01/24/climate-climateentityfeatures-expanded/
-        self._enable_turn_on_off_backwards_compatibility = False
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -97,13 +95,6 @@ class HaierACEntity(ClimateEntity):
     def native_target_temperature(self) -> float:
         return self._device.target_temperature
 
-    # HA 2026.11 renamed these to native_* (the old names stop working in 2027.11); older HA
-    # (down to the 2024.12 minimum) only knows the old names. Providing both keeps the entity
-    # working everywhere and HA uses the native ones without a deprecation warning.
-    temperature_unit = native_temperature_unit
-    current_temperature = native_current_temperature
-    target_temperature = native_target_temperature
-
     @property
     def target_temperature_step(self) -> float:
         return self._device.target_temperature_step
@@ -118,7 +109,7 @@ class HaierACEntity(ClimateEntity):
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set new target temperature (and the mode, if the service call names one)."""
-        temp = kwargs.get("temperature", self.target_temperature)
+        temp = kwargs.get("temperature", self.native_target_temperature)
         hvac_mode = kwargs.get("hvac_mode")
         _LOGGER.debug(f"Setting target temperature to {temp} (hvac_mode={hvac_mode})")
         await self._device.set_temperature(temp, hvac_mode)

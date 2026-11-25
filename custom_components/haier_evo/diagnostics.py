@@ -55,8 +55,7 @@ async def async_get_config_entry_diagnostics(
     state: Any = None
     if haier is not None:
         try:
-            # A JSON round trip gives a private, JSON-safe copy of the state that the websocket
-            # thread keeps updating.
+            # A JSON round trip gives a private, JSON-safe copy of the live state.
             state = json.loads(json.dumps(haier.to_dict(), default=str))
         except Exception as e:  # still return the entry part
             state = {"error": f"{type(e).__name__}: {e}"}
