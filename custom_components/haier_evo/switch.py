@@ -120,7 +120,16 @@ class HaierSwitch(SwitchEntity):
         return bool(getattr(self._device, self._device_attr_name, None))
 
 
-class HaierACLightSwitch(HaierSwitch):
+class HaierACSwitch(HaierSwitch):
+
+    def _use_app_title(self, device: api.HaierAC, feature: str) -> None:
+        # The name the Evo app gives the function (code 31 "Авто влажность" in the attribute list
+        # is "Самоочистка" in the app); the translated name where the description has no screens.
+        if title := device.app_title(device.config[feature]):
+            self._attr_name = title
+
+
+class HaierACLightSwitch(HaierACSwitch):
     _attr_icon = "mdi:lightbulb"
 
     def __init__(self, device: api.HaierAC) -> None:
@@ -128,78 +137,87 @@ class HaierACLightSwitch(HaierSwitch):
         self._device_attr_name = "light_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_light"
         self._attr_translation_key = "ac_light"
+        self._use_app_title(device, "light")
 
 
-class HaierACSoundSwitch(HaierSwitch):
+class HaierACSoundSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "sound_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_sound"
         self._attr_translation_key = "ac_sound"
+        self._use_app_title(device, "sound")
 
 
-class HaierACQuietSwitch(HaierSwitch):
+class HaierACQuietSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "quiet_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_quiet"
         self._attr_translation_key = "ac_quiet"
+        self._use_app_title(device, "quiet")
 
 
-class HaierACTurboSwitch(HaierSwitch):
+class HaierACTurboSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "turbo_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_turbo"
         self._attr_translation_key = "ac_turbo"
+        self._use_app_title(device, "turbo")
 
 
-class HaierACHealthSwitch(HaierSwitch):
+class HaierACHealthSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "health_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_health"
         self._attr_translation_key = "ac_health"
+        self._use_app_title(device, "health")
 
 
-class HaierACComfortSwitch(HaierSwitch):
+class HaierACComfortSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "comfort_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_comfort"
         self._attr_translation_key = "ac_comfort"
+        self._use_app_title(device, "comfort")
 
 
-class HaierACCleaningSwitch(HaierSwitch):
+class HaierACCleaningSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "cleaning_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_cleaning"
         self._attr_translation_key = "ac_cleaning"
+        self._use_app_title(device, "cleaning")
 
 
-class HaierACAntiFreezeSwitch(HaierSwitch):
+class HaierACAntiFreezeSwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "antifreeze_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_antifreeze"
         self._attr_translation_key = "ac_antifreeze"
+        self._use_app_title(device, "antifreeze")
 
 
-class HaierACAutoHumiditySwitch(HaierSwitch):
+class HaierACAutoHumiditySwitch(HaierACSwitch):
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._device_attr_name = "autohumidity_on"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_autohumidity"
         self._attr_translation_key = "ac_autohumidity"
+        self._use_app_title(device, "autohumidity")
 
 
 class HaierREFSuperCoolingSwitch(HaierSwitch):
@@ -273,3 +291,17 @@ class HttpSwitchPOST(HttpSwitch):
     _attr_translation_key = "http_post"
     _kind = "post"
     _flag = "allow_http_post"
+
+
+# (feature, switch) of the air conditioner, in the order the entities are created.
+AC_SWITCHES = (
+    ("light", HaierACLightSwitch),
+    ("sound", HaierACSoundSwitch),
+    ("quiet", HaierACQuietSwitch),
+    ("turbo", HaierACTurboSwitch),
+    ("health", HaierACHealthSwitch),
+    ("comfort", HaierACComfortSwitch),
+    ("cleaning", HaierACCleaningSwitch),
+    ("antifreeze", HaierACAntiFreezeSwitch),
+    ("autohumidity", HaierACAutoHumiditySwitch),
+)

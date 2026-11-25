@@ -1,10 +1,11 @@
 from __future__ import annotations
+import re
 import time
 from pathlib import Path
 from datetime import timedelta
 from requests.exceptions import RequestException
 from tenacity import RetryError
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -30,6 +31,16 @@ PLATFORMS: list[str] = [
 
 FRONTEND_URL = f"/{DOMAIN}/haier-evo-ac-card.js"
 
+# A device of this integration in the device registry is identified by its MAC (the HTTP debug
+# switches have a device of their own, with another identifier).
+_MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+# The cloud sometimes leaves a unit out of the list right after an outage: a setup that misses
+# devices the entry has is retried this many times before it starts with what was listed.
+SETUP_INCOMPLETE_RETRIES = 3
+_INCOMPLETE_SETUPS: dict[str, int] = {}
+# entry_id -> the MACs a setup gave up waiting for (not waited for again until HA restarts).
+_GIVEN_UP: dict[str, set[str]] = {}
+
 # entry_id -> (consecutive rate-limited setups, monotonic time before which a setup must not hit
 # the cloud). HA retries ConfigEntryNotReady as often as every 80s — without this a 429 at
 # startup would become a login attempt every minute and could get the IP blacklisted.
@@ -45,6 +56,40 @@ def _is_rate_limited(exc: BaseException | None) -> bool:
             return True
         exc = exc.__cause__ or exc.__context__
     return False
+
+
+def _known_macs(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
+    # MACs of the Haier devices this entry created before.
+    return {
+        str(identifier).lower()
+        for device in dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
+        for domain, identifier in device.identifiers
+        if domain == DOMAIN and _MAC.match(str(identifier).lower())
+    }
+
+
+def _check_complete(hass: HomeAssistant, entry: ConfigEntry, haier_object: api.Haier) -> None:
+    # Fewer devices listed than the entry has: retry the setup a few times, instead of starting
+    # without them (their entities would be unavailable until the next restart). A unit that stays
+    # away is waited for once per HA start; deleting it in HA ends the wait for good.
+    missing = _known_macs(hass, entry) - haier_object.listed_macs
+    if not missing or missing <= _GIVEN_UP.get(entry.entry_id, set()):
+        _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+        return
+    attempts = _INCOMPLETE_SETUPS.get(entry.entry_id, 0) + 1
+    if attempts <= SETUP_INCOMPLETE_RETRIES:
+        _INCOMPLETE_SETUPS[entry.entry_id] = attempts
+        raise api.InvalidDevicesList(
+            f"the Evo «Мой дом» page did not list {len(missing)} device(s) of this entry "
+            f"(attempt {attempts}/{SETUP_INCOMPLETE_RETRIES})"
+        )
+    _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+    _GIVEN_UP[entry.entry_id] = missing
+    _LOGGER.warning(
+        f"Haier Evo still does not list {', '.join(sorted(missing))}: starting with the "
+        f"{len(haier_object.listed_macs)} device(s) it listed. If a device is gone from the Evo app, "
+        f"delete it in Home Assistant (its page, the menu, Delete)."
+    )
 
 
 async def _async_stop(hass: HomeAssistant, haier_object: api.Haier) -> None:
@@ -88,6 +133,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # user's log the setup 4 s later found them all). HA retries the setup, instead of the
             # entry loading without devices until a manual reload.
             raise api.InvalidDevicesList("the Evo «Мой дом» page listed none of this entry's devices")
+        _check_complete(hass, entry, haier_object)
     except Exception as e:
         # Release the half-initialised object, so a retry starts from scratch.
         await _async_stop(hass, haier_object)
@@ -133,6 +179,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    # A device may be deleted in the UI once the cloud no longer lists it (without this hook HA
+    # offers no way to delete it, and a unit removed from the Evo account stayed for good). Not
+    # while the entry is not loaded: there is no telling which units the cloud still has.
+    haier_object = getattr(entry, "runtime_data", None)
+    if entry.state is not ConfigEntryState.LOADED or not isinstance(haier_object, api.Haier):
+        return False
+    macs = {
+        str(identifier).lower() for domain, identifier in device_entry.identifiers
+        if domain == DOMAIN and _MAC.match(str(identifier).lower())
+    }
+    if not macs:
+        return False  # the HTTP debug switches' device: it belongs to the entry itself
+    removable = not (macs & haier_object.listed_macs)
+    if removable:
+        for mac in macs:
+            _GIVEN_UP.get(entry.entry_id, set()).discard(mac)
+    return removable
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
@@ -146,4 +214,6 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     # Forget the entry's tokens: re-adding the integration (maybe with another account)
     # must start with a fresh login.
     _SETUP_BACKOFF.pop(entry.entry_id, None)
+    _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+    _GIVEN_UP.pop(entry.entry_id, None)
     await hass.async_add_executor_job(api.Haier.remove_tokens_file, hass, entry.entry_id)

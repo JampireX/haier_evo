@@ -153,6 +153,20 @@
             },
             "wm_phase": {
                 "name": "Phase"
+            },
+            "ac_room_temperature": {
+                "name": "Room temperature"
+            },
+            "wm_state": {
+                "name": "State",
+                "state": {
+                    "off": "Off",
+                    "idle": "Idle",
+                    "running": "Running",
+                    "paused": "Paused",
+                    "finished": "Finished",
+                    "cancelled": "Cancelled"
+                }
             }
         },
         "binary_sensor": {
@@ -170,6 +184,21 @@
             },
             "ref_super_cooling": {
                 "name": "Super cooling"
+            },
+            "problem": {
+                "name": "Problem"
+            },
+            "filter": {
+                "name": "Filter cleaning"
+            },
+            "connectivity": {
+                "name": "Cloud connection"
+            },
+            "firmware_update": {
+                "name": "Firmware update"
+            },
+            "wm_child_lock": {
+                "name": "Child lock"
             }
         },
         "switch": {
@@ -220,6 +249,9 @@
     "exceptions": {
         "remote_control_disabled": {
             "message": "Remote control is disabled. Enable it on the washing machine panel to change parameters."
+        },
+        "command_refused": {
+            "message": "{device} does not accept this command now ({details}). The Evo app does not allow it either: e.g. the setting is not available while the unit is off or in this mode."
         }
     }
 }

@@ -106,7 +106,7 @@ class HaierACEntity(ClimateEntity):
 
     @property
     def target_temperature_step(self) -> float:
-        return 1.0
+        return self._device.target_temperature_step
 
     @property
     def available(self) -> bool:

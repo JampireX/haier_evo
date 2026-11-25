@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import re
 import shutil
 from os.path import basename, dirname, exists, join
 from homeassistant.util.yaml import load_yaml
@@ -12,6 +13,8 @@ from . import devices as config_dir
 _KNOWN_VERSIONS: dict[str, set[str]] | None = None
 # User copies already reported as edited (logged once per file, not on every refresh).
 _REPORTED_COPIES: set[str] = set()
+# A model name (from the cloud) that may become a part of a file name: <config>/haier_evo.<model>.yaml.
+SAFE_MODEL = re.compile(r"[A-Za-z0-9()_.-]{1,32}")
 
 
 def _known_versions(name: str) -> set[str]:
@@ -57,6 +60,36 @@ def _yaml_text(value, true: str, false: str) -> str | None:
     return None if value in (None, "") else str(value)
 
 
+def _screen_blocks(data) -> list:
+    modes = data.get("modes") if isinstance(data, dict) and isinstance(data.get("modes"), dict) else {}
+    blocks = modes.get("itemsV2") or modes.get("items") or []
+    return list(blocks) if isinstance(blocks, list) else []
+
+
+def app_screens(data) -> dict[str, str]:
+    """Attributes the Evo app has a control for: {attribute code: the app's title}.
+
+    The app builds its screens from modes.itemsV2 (louvers, cleaning, display light...) and
+    top-level blocks such as muteStatus ("Тихий"). Empty when the description has no screens:
+    then nothing is known to be missing, and everything is shown. The flat attribute list names
+    some attributes otherwise, e.g. 31 "Авто влажность" is "Самоочистка" in the app.
+    (and7ey/haier_evo 1.5.)
+    """
+    screens: dict[str, str] = {}
+    blocks = _screen_blocks(data)
+    if not blocks:
+        return screens
+    blocks += [v for k, v in data.items() if k != "modes" and isinstance(v, dict)]
+    for block in blocks:
+        if not isinstance(block, dict) or not isinstance(block.get("value"), dict):
+            continue
+        code = block["value"].get("name")
+        title = block.get("title")
+        if code not in (None, "") and isinstance(title, str) and title.strip():
+            screens.setdefault(str(code), title.strip())
+    return screens
+
+
 class HaierDeviceConfig(object):
 
     def __init__(self, model: str, userpath: str = "") -> None:
@@ -88,6 +121,12 @@ class HaierDeviceConfig(object):
         # default template made before the model had its own file — follows the package: before,
         # every copy won forever, so fixes in the package never reached existing installs.
         package_dir = dirname(config_dir.__file__)
+        if not SAFE_MODEL.fullmatch(self._model or "") or ".." in self._model:
+            # Not a name for a file the integration writes to (a separator, a NUL, "..").
+            if self._model not in _REPORTED_COPIES:
+                _REPORTED_COPIES.add(self._model)
+                _LOGGER.warning(f"Unexpected device model {self._model!r}, using the default description")
+            return join(package_dir, 'default') + '.yaml'
         package = join(package_dir, self._model) + '.yaml'
         if not exists(package):
             package = join(package_dir, 'default') + '.yaml'
@@ -507,7 +546,8 @@ class Range(dict):
 
     @property
     def data(self) -> dict:
-        return self.get("data", {})
+        data = self.get("data")
+        return data if isinstance(data, dict) else {}
 
     @property
     def min_value(self) -> int | float | str | None:
@@ -557,6 +597,8 @@ class Item(dict):
     @property
     def value(self) -> str | None:
         value = self.get("data")
+        if isinstance(value, (dict, list)):
+            return None  # not a value the device could take (it broke the lookups before)
         return {
             "true": "1",
             "false": "0",
@@ -706,7 +748,11 @@ class Modifier(dict):
 class Constraint(list):
 
     def __init__(self, data: list) -> None:
-        super().__init__(data)
+        super().__init__(i for i in _list(data) if isinstance(i, dict))
+
+    def extend(self, data) -> None:
+        # Rules of an unexpected type (not a list of objects) are left out.
+        super().extend(i for i in _list(data) if isinstance(i, dict))
 
     def apply(self, commands: list[dict]) -> list[dict]:
         if len(self) == 0 or not commands:
@@ -731,21 +777,23 @@ class Constraint(list):
         command_value = command.get("value")
         additionals = []
         for item in self:
-            cond = item.get("pendingCondition", {})
-            for cond_command in cond.get("commands", []):
-                if command_code != cond_command.get("commandName"):
+            cond = _dict(item.get("pendingCondition"))
+            for cond_command in _list(cond.get("commands")):
+                if not isinstance(cond_command, dict) or command_code != cond_command.get("commandName"):
                     continue
-                values = [self.value2code(x) for x in (cond_command.get("values") or [])]
+                values = [self.value2code(x) for x in _list(cond_command.get("values"))]
                 if command_value not in values:
                     continue
-                additionals.append(item.get("additionalCommands", {}))
+                additionals.append(_dict(item.get("additionalCommands")))
         return additionals
 
     def merge_commands(self, command: dict, additionals: list[dict]) -> list[dict]:
         commands = {"PREPEND": [], "APPEND": []}
         for additional in additionals:
             merge_type = additional.get("mergeType")
-            additional_commands = [self.format_command(x) for x in additional.get("commands", [])]
+            additional_commands = [
+                self.format_command(x) for x in _list(additional.get("commands")) if isinstance(x, dict)
+            ]
             target = commands.get(merge_type, [])
             target.extend(filter(
                 lambda c: c not in target,
@@ -755,4 +803,6 @@ class Constraint(list):
 
     @staticmethod
     def value2code(value: str) -> str:
+        if not isinstance(value, str):
+            return value  # (a dict or a list here broke the lookup with "unhashable type")
         return {"true": "1", "false": "0"}.get(value, value)

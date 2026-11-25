@@ -97,6 +97,9 @@ WS_CLOSE_AUTH_FAILED = 1007
 # unless it was obtained less than this many seconds ago: a server that rejects even fresh tokens
 # must not drive a tight refresh loop (at most one forced refresh per this interval).
 TOKEN_REJECT_MIN_AGE = 60
+# Tokens are renewed this many seconds before their expiry (a token that expires on its way to the
+# server is rejected there).
+TOKEN_RENEW_MARGIN = 60
 # Washing machines report the running program as codes: attribute 90 tells apart the "evo"
 # programs (they all share 0 == 45), attribute 0 the others. They are matched against the
 # program definitions (businessAttributes), the more specific attribute first.

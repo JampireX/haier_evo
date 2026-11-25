@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 import os
+import re
 import time
 import threading
 import uuid
@@ -59,6 +60,81 @@ def refuse_redirect(response: requests.Response) -> None:
             f"{response.status_code} redirect to {response.headers.get('Location')!r} refused",
             response=response,
         )
+
+
+# A device id of the device list: a MAC address (UUID ids are appliances without Wi-Fi).
+_MAC = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# Device alarms (REST "alarms", WS statuses[].alarms and the "alarms" event): a reminder to clean the
+# filter is maintenance, not a fault; "alarmCancel" is the cloud's "alarms cleared" marker.
+FILTER_ALARM = "filterCleaningAlarm"
+MAINTENANCE_ALARMS = frozenset({FILTER_ALARM})
+ALARM_CANCEL = "alarmCancel"
+
+
+def _part(data, key: str) -> dict:
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+# Washing machines: the app's screens link attributes to their meaning ({"name": code,
+# "description": "remainingTimeHH"}); the codes differ between models (remaining hours: 31 on HW60,
+# 32 on HW90), so a model without its own YAML is read through these. Meaning -> HaierWM attribute.
+WM_MEANINGS = {
+    "onOffStatus": "status",
+    "remainingTimeHH": "remaining_hours",
+    "remainingTimeMM": "remaining_minutes",
+    "remainingDryTime": "remaining_time",
+    "remoteCtrValid": "remote_control",
+    "childLockStatus": "child_lock",
+    "cyclePhase": "phase",
+}
+_MEANING = re.compile(r"[A-Za-z][A-Za-z0-9]{2,40}")
+# The state of a program as the cloud names it (control.currentProgram, program events).
+WM_PROGRAM_STATES = {
+    "IN_PROGRESS": "running", "STARTED": "running", "PAUSED": "paused",
+    "FINISHED": "finished", "CANCELED": "cancelled", "CANCELLED": "cancelled",
+}
+WM_STATES = ("off", "idle", "running", "paused", "finished", "cancelled")
+
+
+def laundry_codes(data) -> dict[str, str]:
+    # {meaning: attribute code} from the app's screens in a washing machine's description; the
+    # first link of a meaning wins (as upstream's laundry_codes).
+    inner = data.get("smartDeviceControl") if isinstance(data, dict) else None
+    inner = inner if isinstance(inner, dict) else (data if isinstance(data, dict) else {})
+    attributes = inner.get("attributes")
+    known = {
+        str(a.get("name")) for a in (attributes if isinstance(attributes, list) else []) if isinstance(a, dict)
+    }
+    found: dict[str, str] = {}
+
+    def walk(node, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            code, meaning = node.get("name"), node.get("description")
+            if (isinstance(code, str) and code in known and isinstance(meaning, str)
+                    and _MEANING.fullmatch(meaning) and meaning != "not found"):
+                found.setdefault(meaning, code)
+            for key, value in node.items():
+                if key not in ("smartDeviceControl", "attributes"):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1)
+
+    walk(data if isinstance(data, dict) else {})
+    return found
+
+
+def firmware_text(value) -> str | None:
+    # A firmware version as the device registry takes it: text or None.
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf"):
+        return str(value)
+    return None
 
 
 class ManyRequestsError(HTTPError):
@@ -162,8 +238,7 @@ class AuthResponse(object):
     @property
     def access_expire(self) -> datetime | None:
         assert "expire" in self.token, f"Bad data: expire not found"
-        value = self.token["expire"]
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+        return parse_expire(self.token["expire"])
 
     @property
     def refresh_token(self) -> str | None:
@@ -175,8 +250,29 @@ class AuthResponse(object):
     @property
     def refresh_expire(self) -> datetime | None:
         assert "refreshExpire" in self.token, f"Bad data: refreshExpire not found"
-        value = self.token["refreshExpire"]
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+        return parse_expire(self.token["refreshExpire"])
+
+
+_MSK = timezone(timedelta(hours=+3.0))
+
+
+def parse_expire(value) -> datetime | None:
+    # A token expiry: "2026-11-25T15:04:05+0300" as the cloud sends it, ISO forms ("+03:00",
+    # fractions) as well; naive times are the cloud's Moscow time. Anything else (a number, an
+    # impossible date) is None instead of failing the sign-in.
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    parsed = None
+    for parse in (datetime.fromisoformat, lambda v: datetime.strptime(v, "%Y-%m-%dT%H:%M:%S%z")):
+        try:
+            parsed = parse(value)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=_MSK)
 
 
 class _TimeoutSSLContext(ssl.SSLContext):
@@ -269,7 +365,11 @@ class Haier(object):
         self._send_lock = threading.Lock()
         self._pull_data = None
         self._last_refresh = None
-        self._device_id = str(uuid.uuid4())
+        # Stable per entry (as and7ey/haier_evo 1.x): a new random one on every start made every
+        # restart a new phone for the cloud.
+        self._device_id = (
+            str(uuid.uuid5(uuid.NAMESPACE_URL, f"{C.DOMAIN}:{entry_id}")) if entry_id != "default" else str(uuid.uuid4())
+        )
         self.hass: HomeAssistant = hass
         self.devices: list[HaierDevice] = []
         self.email: str = email
@@ -387,11 +487,9 @@ class Haier(object):
                 _LOGGER.info(f"Saved tokens belong to another account/region, ignoring: {filename}")
                 return
             self.token = data.get("token", None)
-            tokenexpire = data.get("tokenexpire")
-            self.tokenexpire = datetime.fromisoformat(tokenexpire) if tokenexpire else None
+            self.tokenexpire = parse_expire(data.get("tokenexpire"))
             self.refreshtoken = data.get("refreshtoken", None)
-            refreshexpire = data.get("refreshexpire")
-            self.refreshexpire = datetime.fromisoformat(refreshexpire) if refreshexpire else None
+            self.refreshexpire = parse_expire(data.get("refreshexpire"))
             _LOGGER.info(f"Loaded tokens file: {filename}")
         except FileNotFoundError:
             _LOGGER.warning(f"No tokens file: {filename}")
@@ -516,6 +614,7 @@ class Haier(object):
             headers.setdefault('User-Agent', "evo-mobile")
             headers.setdefault('Platform', "android")
             headers.setdefault('Accept', "*/*")
+            headers.setdefault('Device-Id', self._device_id)  # as the app: on sign-in too
             resp = requests.request(method, url, allow_redirects=False, **kwargs)
             # _LOGGER.debug(resp.text)
             # Handling 429 Too Many Requests with retry
@@ -620,6 +719,11 @@ class Haier(object):
             assert resp, "No response from login"
             self.token = resp.access_token
             self.tokenexpire = resp.access_expire
+            if self.tokenexpire is None:
+                # An expiry we cannot read: assume a short life rather than refreshing on every
+                # request (None means "expired" to auth()).
+                _LOGGER.warning(f"Unreadable access token expiry {resp.token.get('expire')!r}, assuming 30 minutes")
+                self.tokenexpire = datetime.now(_MSK) + timedelta(minutes=30)
             self.refreshtoken = resp.refresh_token
             self.refreshexpire = resp.refresh_expire
             self._token_obtained_at = time.monotonic()
@@ -651,8 +755,8 @@ class Haier(object):
 
     def _auth_action(self) -> str | None:
         # What auth() has to do: None (the token is valid), "refresh" or "login".
-        tzinfo = timezone(timedelta(hours=+3.0))
-        now = datetime.now(tzinfo)
+        # A minute early: a token that expires on its way to the server is rejected there.
+        now = datetime.now(_MSK) + timedelta(seconds=C.TOKEN_RENEW_MARGIN)
         tokenexpire = self.tokenexpire or now
         refreshexpire = self.refreshexpire or now
         if self.token:
@@ -811,50 +915,92 @@ class Haier(object):
 
     @classmethod
     def _parse_device_specs(cls, data: dict) -> tuple[list[dict], list[dict], list[str]]:
-        # Devices of the SDUI "smartHome" page: a "deviceList" component (items with a deep link
-        # carrying type/deviceId/serialNum), the known container preferred; newer page versions
-        # use "smartHomeSpacesV1" (rooms.rooms[].items[] with macAddress).
-        containers = ((data.get("presentation") or {}).get("layout") or {}).get("scrollContainer") or []
+        # Devices of the SDUI "smartHome" page: "deviceList" components (items with a deep link
+        # carrying type/deviceId/serialNum) — every one of them, the known container first; newer
+        # page versions use "smartHomeSpacesV1" (rooms.rooms[].items[] with macAddress). Parts of
+        # an unexpected type are skipped, not allowed to fail the whole list.
+        presentation = data.get("presentation") if isinstance(data, dict) else None
+        layout = presentation.get("layout") if isinstance(presentation, dict) else None
+        containers = layout.get("scrollContainer") if isinstance(layout, dict) else None
         lists, spaces, components = [], [], []
-        for item in containers:
+        for item in containers if isinstance(containers, list) else []:
             if not isinstance(item, dict):
                 continue
-            component = (item.get("trackingData") or {}).get("component") or {}
+            tracking = item.get("trackingData")
+            component = tracking.get("component") if isinstance(tracking, dict) else None
+            component = component if isinstance(component, dict) else {}
             name = component.get("componentName") or item.get("component") or ""
             components.append(name)
             if name == "deviceList":
-                lists.append((component.get("componentId") == C.DEVICE_LIST_COMPONENT_ID, item))
+                lists.append((component.get("componentId") != C.DEVICE_LIST_COMPONENT_ID, item))
             elif name == "smartHomeSpacesV1" or item.get("component") == "smartHomeSpacesV1":
                 spaces.append(item)
-        lists = [i for known, i in lists if known] or [i for _, i in lists]
+        lists = [i for _, i in sorted(lists, key=lambda pair: pair[0])]
         found: dict[str, dict] = {}
         used = []
 
-        def add(raw_type: str, mac: str, serial: str, title: str) -> None:
-            mac = (mac or "").replace("%3A", ":").lower()
-            if mac and mac not in found:
-                found[mac] = dict(device_type=cls._device_type(raw_type), device_mac=mac,
-                                  device_serial=serial or "", device_title=title or "")
+        def text(value) -> str:
+            return value if isinstance(value, str) else ""
+
+        def link_of(entry: dict):
+            action = entry.get("action")
+            return urlparse(text(action.get("link")) if isinstance(action, dict) else "")
+
+        def add(raw_type: str, mac: str, serial: str, title: str, strict: bool = True) -> None:
+            # strict: the deep links of deviceList carry MACs (as upstream checks); the ids of the
+            # newer rooms page are only checked not to be UUIDs (their format is not confirmed).
+            mac = text(mac).replace("%3A", ":").lower()
+            if _UUID.match(mac) or (strict and not _MAC.match(mac)) or not mac:
+                # A UUID id is an appliance without Wi-Fi added in the app (a dishwasher, a
+                # hood): the cloud has no state for it — loading it only failed at every start.
+                if mac:
+                    _LOGGER.debug(f"Skipping a device list item with a non-MAC id ({text(title)!r})")
+                return
+            if mac not in found:
+                found[mac] = dict(device_type=cls._device_type(text(raw_type)), device_mac=mac,
+                                  device_serial=text(serial), device_title=text(title))
 
         for item in lists:
             state = cls._component_state(item)
             used.append({**item, "state": state})
-            for d in state.get("items") or []:
-                query = parse_qs(urlparse(((d or {}).get("action") or {}).get("link", "")).query)
+            entries = state.get("items")
+            for d in entries if isinstance(entries, list) else []:
+                if not isinstance(d, dict):
+                    continue
+                link = link_of(d)
+                if link.netloc == "non-iot" or link.path.startswith("/non-iot"):
+                    continue  # an appliance without Wi-Fi: nothing to read or control
+                query = parse_qs(link.query)
                 add(query.get("type", ["UNKNOWN"])[0], query.get("deviceId", [""])[0],
-                    query.get("serialNum", [""])[0], d.get("title", ""))
+                    query.get("serialNum", [""])[0], d.get("title"))
         if not found:
             for item in spaces:
                 state = cls._component_state(item)
                 used.append({**item, "state": state})
-                for room in (state.get("rooms") or {}).get("rooms") or []:
-                    for d in (room or {}).get("items") or []:
-                        query = parse_qs(urlparse(((d or {}).get("action") or {}).get("link", "")).query)
+                rooms = state.get("rooms")
+                rooms = rooms.get("rooms") if isinstance(rooms, dict) else None
+                for room in rooms if isinstance(rooms, list) else []:
+                    entries = room.get("items") if isinstance(room, dict) else None
+                    for d in entries if isinstance(entries, list) else []:
+                        if not isinstance(d, dict):
+                            continue
+                        link = link_of(d)
+                        if link.netloc == "non-iot" or link.path.startswith("/non-iot"):
+                            continue
+                        query = parse_qs(link.query)
                         add(query.get("type", ["UNKNOWN"])[0],
-                            d.get("macAddress") or query.get("deviceId", query.get("macAddress", [""]))[0],
-                            d.get("serialNumber") or query.get("serialNum", [""])[0],
-                            d.get("name") or d.get("title", ""))
+                            text(d.get("macAddress")) or query.get("deviceId", query.get("macAddress", [""]))[0],
+                            text(d.get("serialNumber")) or query.get("serialNum", [""])[0],
+                            text(d.get("name")) or text(d.get("title")), strict=False)
         return list(found.values()), used, components
+
+    @property
+    def listed_macs(self) -> set[str]:
+        # The devices the cloud listed: loaded, and those whose description failed to load (they
+        # are retried by the heartbeat — not gone from the account).
+        return {str(d.device_id).lower() for d in self.devices} | {
+            str(p["spec"]["device_mac"]).lower() for p in self._pending_devices
+        }
 
     def register_platform(self, platform: str, async_add_entities: Callable) -> None:
         # Kept so that a device loaded after setup (see retry_pending_devices) gets its entities.
@@ -890,15 +1036,26 @@ class Haier(object):
                 device.reset_session_state()
                 device.init_if_needed()
 
-    @staticmethod
-    def _device_entities(device: HaierDevice, platform: str) -> list:
-        # The entities of one device on one platform; an error in that device's code costs only
-        # its own entities there, not the platform (and the entities of every other device).
+    def _device_entities(self, device: HaierDevice, platform: str) -> list:
+        # The entities of one device on one platform (runs in the event loop); an error in that
+        # device's code costs only its own entities there, not the platform (and the entities of
+        # every other device).
         try:
-            return getattr(device, f"create_entities_{platform}")()
+            entities = getattr(device, f"create_entities_{platform}")()
         except Exception:
             _LOGGER.exception(f"Failed to create the {platform} entities of {device.device_name}")
             return []
+        # Entities an earlier version created that the device does not offer leave the registry,
+        # instead of staying "unavailable" for good.
+        hidden = [unique_id for where, unique_id in device.hidden_entities if where == platform]
+        if hidden:
+            from homeassistant.helpers import entity_registry as er
+            registry = er.async_get(self.hass)
+            for unique_id in hidden:
+                if entity_id := registry.async_get_entity_id(platform, C.DOMAIN, unique_id):
+                    _LOGGER.info(f"Removing {entity_id}: the Evo app offers no such control for {device.device_name}")
+                    registry.async_remove(entity_id)
+        return entities
 
     def platform_entities(self, platform: str) -> list:
         # For the platforms' async_setup_entry.
@@ -1447,6 +1604,11 @@ class HaierDevice(object):
         self._read_started: float | None = None
         # The device's link to the cloud from deviceConnectionStatusEvent (GOOD / BAD / LOST).
         self.link_status: str | None = None
+        # Alarm names the device reports (e.g. "indoorFanErr"), see _set_alarms.
+        self.alarms: list[str] = []
+        # (platform, unique_id) of entities the device does not offer (the Evo app has no control
+        # for them): removed from the entity registry when the platform is set up.
+        self.hidden_entities: list[tuple[str, str]] = []
 
     def __repr__(self) -> str:
         return (
@@ -1525,6 +1687,10 @@ class HaierDevice(object):
             "device_name": self.device_name,
             "device_serial": self.device_serial,
             "sw_version": self.sw_version,
+            "connected": self.connected,
+            "link_status": self.link_status,
+            "alarms": self.alarms,
+            "firmware_update": self.firmware_update,
             "config": self.config.to_dict() if self.config else None,
             "backend_data": self.status_data,
         }
@@ -1534,20 +1700,103 @@ class HaierDevice(object):
         # WM returns info/status/settings/attributes nested inside smartDeviceControl,
         # while control/allProgram sit next to it at the top level of backend_data.
         # AC/REF return everything at the top level. status_data is always kept complete.
-        inner = data.get("smartDeviceControl")
-        inner = inner if isinstance(inner, dict) else data
+        inner = self._device_part(data)
         info = inner.setdefault("info", {})
-        self.device_serial = info.setdefault("serialNumber", self.device_serial)
-        device_model = info.setdefault("model", "AC")
+        if not isinstance(info, dict):
+            # The model in it is a part of every unique_id: a description without it is unreadable.
+            raise ValueError("the device description has no device info")
+        self.device_serial = info.get("serialNumber") or self.device_serial
+        # "AC" only when the key is missing (as before); an empty model stays empty, or the
+        # unique_ids "<mac>__..." of such a unit would turn into "<mac>_AC_...".
+        device_model = info.get("model", "AC")
+        device_model = "AC" if device_model is None else str(device_model)
         device_model = device_model.replace('-','').replace('/', '')[:11]
         self.device_model = device_model
-        self.available = inner.setdefault("status", "ONLINE")
-        settings = inner.setdefault("settings", {})
-        self.device_name = settings.setdefault("name", {}).setdefault("name", self.device_name)
-        self.sw_version = settings.setdefault('firmware', {}).setdefault('value', None)
+        # "status" and "settings" may come as null: read as "not there".
+        self.available = inner.get("status") or "ONLINE"
+        settings = _part(inner, "settings")
+        self.device_name = _part(settings, "name").get("name") or self.device_name
+        self.sw_version = firmware_text(_part(settings, "firmware").get("value"))
+        if isinstance(inner.get("alarms"), list):
+            # Only a list says something: descriptions without the key (AS70S2SF2FA) would clear
+            # the alarms pushed over the websocket at every REST read.
+            self._set_alarms(inner["alarms"])
         # read config and current values (inner view: info/attributes/businessAttributes)
         self._load_config_from_attributes(inner)
         return data
+
+    @staticmethod
+    def _device_part(data) -> dict:
+        # The part of a description with info, settings, attributes and alarms.
+        inner = data.get("smartDeviceControl") if isinstance(data, dict) else None
+        return inner if isinstance(inner, dict) else (data if isinstance(data, dict) else {})
+
+    def _set_alarms(self, alarms) -> None:
+        # Live units send an empty list; entries are taken as alarm names ("indoorFanErr") or
+        # as objects carrying one.
+        names = []
+        for alarm in alarms if isinstance(alarms, list) else []:
+            if isinstance(alarm, dict):
+                alarm = alarm.get("name") or alarm.get("alarmName") or alarm.get("code")
+            if alarm and str(alarm) != ALARM_CANCEL and str(alarm) not in names:
+                names.append(str(alarm))
+        if names != self.alarms:
+            if names:
+                # A reminder to clean the filter is no fault: INFO, not a warning.
+                log = _LOGGER.info if set(names) <= MAINTENANCE_ALARMS else _LOGGER.warning
+                log(f"{self.device_name}: the device reports {', '.join(self._alarm_texts(names))} ({', '.join(names)})")
+            else:
+                _LOGGER.info(f"{self.device_name}: alarms cleared")
+        self.alarms = names
+
+    def _alarm_texts(self, alarms: list[str]) -> list[str]:
+        # Human-readable alarms from the cloud's own table (errors.alarmToResult).
+        errors = _part(self._device_part(self._status_data), "errors")
+        table = _part(errors, "alarmToResult")
+        unknown = _part(errors, "undefinedAlarm").get("text") or "Unknown error"
+        return [str(_part(table, alarm).get("text") or f"{unknown} ({alarm})") for alarm in alarms]
+
+    @property
+    def alarm_texts(self) -> list[str]:
+        return self._alarm_texts(self.alarms)
+
+    def app_title(self, code) -> str | None:
+        # What the Evo app calls an attribute, when the description has its screens.
+        return None if code is None else CFG.app_screens(self._status_data).get(str(code))
+
+    def offered_by_app(self, code) -> bool:
+        # False when the app has screens for this device, but none for the attribute.
+        screens = CFG.app_screens(self._status_data)
+        return not screens or str(code) in screens
+
+    @property
+    def problem(self) -> bool:
+        # A fault; a reminder to clean the filter has a sensor of its own.
+        return any(alarm not in MAINTENANCE_ALARMS for alarm in self.alarms)
+
+    @property
+    def filter_cleaning(self) -> bool:
+        return FILTER_ALARM in self.alarms
+
+    @property
+    def connected(self) -> bool:
+        # The cloud reports the device ONLINE (the "Связь с облаком" sensor).
+        return self._available
+
+    @property
+    def _firmware(self) -> dict:
+        return _part(_part(self._device_part(self._status_data), "settings"), "firmware")
+
+    @property
+    def firmware_update(self) -> bool | None:
+        # The cloud says a newer firmware is waiting (the Evo app installs it).
+        value = self._firmware.get("updateRequired")
+        return value if isinstance(value, bool) else None
+
+    @property
+    def firmware_auto_update(self) -> bool | None:
+        value = _part(self._firmware, "autoUpdate").get("enabled")
+        return value if isinstance(value, bool) else None
 
     def _load_config_from_attributes(self, data: dict) -> None:
         pass
@@ -1640,6 +1889,14 @@ class HaierDevice(object):
 
     def _handle_status_update(self, received_message: dict) -> None:
         properties = self._status_properties(received_message)
+        payload = received_message.get("payload")
+        statuses = payload.get("statuses") if isinstance(payload, dict) else None
+        alarm_lists = [
+            status["alarms"] for status in (statuses if isinstance(statuses, list) else [])
+            if isinstance(status, dict) and isinstance(status.get("alarms"), list)
+        ]
+        if alarm_lists:
+            self._set_alarms([alarm for alarms in alarm_lists for alarm in alarms])
         if len(properties) >= C.WS_FULL_SNAPSHOT_MIN_PROPS:
             self._snapshot_seen = True
         # Visible at INFO so it is clear whether realtime updates actually arrive and which
@@ -1676,10 +1933,14 @@ class HaierDevice(object):
     def _send_message(self, message: dict) -> bool:
         return self._haier.send_message(json.dumps(message)) is not False
 
-    def _send_commands(self, commands: list[dict], then: dict | None = None) -> None:
-        self._send_group_command(commands, then=then)
+    def _send_commands(self, commands: list[dict], then: dict | None = None,
+                       on_reject: list[dict] | None = None) -> None:
+        self._send_group_command(commands, then=then, on_reject=on_reject)
 
-    def _send_group_command(self, commands: list[dict], attempt: int = 1, then: dict | None = None) -> None:
+    def _send_group_command(self, commands: list[dict], attempt: int = 1, then: dict | None = None,
+                            on_reject: list[dict] | None = None) -> None:
+        # on_reject: commands of the group sent once more on their own if the cloud rejects the
+        # group (see HaierAC.switch_on); single commands are answered one by one and need none.
         if not self.config.command_name:
             for i, c in enumerate(commands):
                 # A follow-up (then) waits for the last of them.
@@ -1688,7 +1949,7 @@ class HaierDevice(object):
         with self._cmd_lock:
             trace = str(uuid.uuid4())
             self._record_sent(commands, trace, attempt)
-            self._expect_ack(trace, commands, single=False, attempt=attempt, then=then)
+            self._expect_ack(trace, commands, single=False, attempt=attempt, then=then, on_reject=on_reject)
             sent = self._send_message({
                 "action": "operation",
                 "macAddress": self.device_id,
@@ -1747,12 +2008,13 @@ class HaierDevice(object):
     # nothing. Now the session is re-established and the command resent once; if that is not
     # answered either, the loss is logged and the real state is pulled back.
     def _expect_ack(self, trace: str, commands: list[dict], single: bool, attempt: int,
-                    then: dict | None = None) -> None:
+                    then: dict | None = None, on_reject: list[dict] | None = None) -> None:
         # Registered before sending: the answer can arrive before _send_message returns.
         with self._sent_lock:
             self._awaiting_ack[trace] = {
                 "commands": commands, "single": single, "attempt": attempt,
                 "session": None, "sent": False, "extended": False, "then": then,
+                "on_reject": on_reject,
             }
             if then:
                 # The follow-up's values are shown at once: guard them against stale status
@@ -1866,6 +2128,13 @@ class HaierDevice(object):
         # Whether an unanswered command may be sent once more automatically.
         return True
 
+    def _rejected_rest(self, entry: dict) -> list[dict]:
+        # Commands of a rejected group worth sending again on their own (see HaierAC).
+        return []
+
+    def _send_rest(self, commands: list[dict]) -> None:
+        pass
+
     def _resend(self, trace: str, entry: dict) -> None:
         with self._cmd_lock:
             # Checked again under the send lock: a newer command for the same attribute sent
@@ -1886,7 +2155,8 @@ class HaierDevice(object):
                 for i, command in enumerate(pending):
                     self._send_single_command(command, 2, then if i == len(pending) - 1 else None)
             else:
-                self._send_group_command(pending, attempt=2, then=then)
+                on_reject = [c for c in entry.get("on_reject") or [] if c in pending] or None
+                self._send_group_command(pending, attempt=2, then=then, on_reject=on_reject)
 
     def _drop_followup(self, entry: dict | None) -> None:
         then = (entry or {}).get("then")
@@ -2067,7 +2337,10 @@ class HaierDevice(object):
                 # state so HA does not keep showing what the device refused to do.
                 self._drop_followup(entry)
                 self._clear_sent_by_trace(trace)
-                self._schedule_refresh_after_failure()
+                if entry and (rest := self._rejected_rest(entry)):
+                    threading.Thread(target=self._send_rest, args=(rest,), daemon=True).start()
+                else:
+                    self._schedule_refresh_after_failure()
             else:
                 _LOGGER.info(
                     f"CMD ACK [{self.device_name}] trace={trace} errNo=0 latency={latency}"
@@ -2083,7 +2356,11 @@ class HaierDevice(object):
         elif message_type in ("ProgramWasherBaseEvent", "ProgramDryerBaseEvent"):
             self._handle_program_event(message_dict)
         elif message_type == "alarms":
-            _LOGGER.info(f"{self.device_name}: alarms {message_dict.get('payload')}")
+            payload = message_dict.get("payload")
+            alarms = payload.get("alarms") if isinstance(payload, dict) else None
+            if isinstance(alarms, list):
+                self._set_alarms(alarms)
+                self.write_ha_state()
         else:
             _LOGGER.warning(f"Got unknown message {message_type!r} for {self.device_name}")
             _LOGGER.debug(f"Unknown message: {message_dict}")
@@ -2181,7 +2458,7 @@ class HaierAC(HaierDevice):
         **kwargs
     ) -> None:
         super().__init__(**kwargs)
-        self.current_temperature = 0
+        self.current_temperature = None  # unknown until reported (0 was shown as a real 0 °C)
         self.target_temperature = 0
         self.status = None
         self.mode = None
@@ -2191,6 +2468,7 @@ class HaierAC(HaierDevice):
         self._preset_mode = None
         self.min_temperature = 7
         self.max_temperature = 35
+        self.target_temperature_step = 1.0
         self.light_on = True
         self.sound_on = True
         self.quiet_on = False
@@ -2201,6 +2479,9 @@ class HaierAC(HaierDevice):
         self.antifreeze_on = False
         self.autohumidity_on = False
         self.eco_sensor = None
+        # A setpoint set while the unit is off (the cloud keeps it read-only then): shown at once
+        # and sent with the next turn-on (see set_temperature / switch_on).
+        self._deferred_temperature: float | None = None
         self._get_status(backend_data)
         self._inited = False
 
@@ -2252,7 +2533,21 @@ class HaierAC(HaierDevice):
         attr = self.config.get_attr_by_code(code)
         if not (attr and value is not None):
             return
-        self._raw[str(code)] = CFG.Modifier.norm(value)
+        norm = CFG.Modifier.norm(value)
+        previous = self._raw.get(str(code))
+        self._raw[str(code)] = norm
+        if self._deferred_temperature is not None and (
+            (attr.name == "status" and norm == "1")
+            or (attr.name == "target_temperature" and norm != previous)
+        ):
+            # Turned on elsewhere, or the unit reports a setpoint of its own: the value kept for
+            # our next turn-on is stale. A repeat of the setpoint the unit had is neither.
+            self._deferred_temperature = None
+            target = self.config['target_temperature']
+            if attr.name == "status" and target is not None:
+                # Show the unit's own setpoint again (the push may carry the power state alone).
+                if (unit := parsefloat(self._raw.get(str(target)))) is not None:
+                    self.target_temperature = unit
         if attr.name == "current_temperature":
             if (v := parsefloat(value)) is not None:
                 self.current_temperature = v
@@ -2261,7 +2556,9 @@ class HaierAC(HaierDevice):
             if (v := parseint(self._norm_value(value))) is not None:
                 self.status = v
         elif attr.name == "target_temperature":
-            if (v := parsefloat(value)) is not None:
+            if self._deferred_temperature is not None:
+                self.target_temperature = self._deferred_temperature  # what goes out on turn-on
+            elif (v := parsefloat(value)) is not None:
                 self.target_temperature = v
         elif attr.name == "mode":
             self.mode = attr.get_item_name(value)
@@ -2300,20 +2597,28 @@ class HaierAC(HaierDevice):
         # lock) never see a half-built one.
         config = CFG.HaierACConfig(self.device_model, self.hass.config.path(C.DOMAIN))
         attributes = data.get("attributes") or []
-        sensors = (data.get("sensors") or {}).get("items") or []
+        sensors = _part(data, "sensors").get("items")
         sensor_curr_temp = next(filter(lambda i: (
             isinstance(i, dict)
             and isinstance(i.get("value"), dict)
             and i.get("value", {}).get("description") == "indoorTemperature"
-        ), sensors), {}).get("value", {}).get("name")
-        attrs = sorted(map(CFG.Attribute, attributes), key=CFG.Attribute.sort_key)
+        ), sensors if isinstance(sensors, list) else []), {}).get("value", {}).get("name")
+        attrs = sorted(
+            (CFG.Attribute(a) for a in (attributes if isinstance(attributes, list) else []) if isinstance(a, dict)),
+            key=CFG.Attribute.sort_key,
+        )
+        if sensor_curr_temp is None:
+            # No "indoorTemperature" sensor in the description: the first room temperature
+            # attribute, instead of none (the climate entity showed no temperature at all).
+            sensor_curr_temp = next((a.code for a in attrs if a.name == "current_temperature"), None)
         for attr in attrs:
-            if attr.name == "current_temperature" and str(attr.code) != sensor_curr_temp:
+            if attr.name == "current_temperature" and str(attr.code) != str(sensor_curr_temp):
                 continue
             config.attrs.append(attr)
         config.merge_attributes()
         config.constraint.extend(data.get("constraint") or [])
-        config.modifiers = [CFG.Modifier(m) for m in data.get("modifiers") or [] if isinstance(m, dict)]
+        modifiers = data.get("modifiers")
+        config.modifiers = [CFG.Modifier(m) for m in (modifiers if isinstance(modifiers, list) else []) if isinstance(m, dict)]
         first = self._config is None  # the attributes are logged on the first load only
         self._config = config
         skip = self._stale_codes(config)
@@ -2329,6 +2634,9 @@ class HaierAC(HaierDevice):
                     self.min_temperature = min_value
                 if max_value is not None:
                     self.max_temperature = max_value
+                # The step the cloud gives (every unit seen so far: 1); 0 or junk keeps 1.
+                if (step := parsefloat(attr.range.step)) is not None and 0 < step <= 5:
+                    self.target_temperature_step = step
             if first:
                 _LOGGER.debug(f"{self.device_name}: {attr}")
 
@@ -2440,7 +2748,9 @@ class HaierAC(HaierDevice):
         return self.config.get_values('swing_horizontal_mode')
 
     def get_swing_modes(self) -> list[str]:
-        return self.config.get_values('swing_mode')
+        # "special" (code 9) is "только для специальной модели" per the cloud: not offered, but a
+        # unit reporting it is still shown as such.
+        return [m for m in self.config.get_values('swing_mode') if m != "special"]
 
     def get_preset_modes(self) -> list[str]:
         read_only = self._restrictions()[0]
@@ -2458,8 +2768,17 @@ class HaierAC(HaierDevice):
             self.switch_off()  # the target is read-only while off (API modifiers): not sent
         elif hvac_mode:
             self.switch_on(hvac_mode, extra=command)
+        elif self.status == 0 and self._writable(command, {"target_temperature"})[1]:
+            # Off, and the cloud keeps the setpoint read-only until the unit runs: Alice and
+            # thermostat cards may set the temperature first ("включи на 24"). Shown at once and
+            # sent with the next turn-on, as the Evo app does not allow it either.
+            self._deferred_temperature = parsefloat(value)
+            self.target_temperature = self._deferred_temperature
+            _LOGGER.info(f"{self.device_name}: setpoint {number_text(value)} kept for the next turn-on")
+            self.write_ha_state()
         else:
-            self._command(command, {"target_temperature"})
+            self._deferred_temperature = None
+            self._command(command, {"target_temperature"}, user=True)
 
     def _get_status_commands(self, turn_on: bool) -> list[dict]:
         # Power on/off command, with a guaranteed numeric fallback. The value is normally
@@ -2492,6 +2811,13 @@ class HaierAC(HaierDevice):
             # (in auto they reset the target to 24 and the fan to auto).
             follow += self.get_commands("mode", mode)
             names.add("mode")
+        if extra is None and self._deferred_temperature is not None and self.config['target_temperature']:
+            # The setpoint set while off; the follow-up re-checks it (fan only takes none).
+            extra = [{
+                "commandName": self.config['target_temperature'],
+                "value": number_text(self._deferred_temperature),
+            }]
+        self._deferred_temperature = None
         if extra:
             follow += extra
             names.add("target_temperature")
@@ -2509,25 +2835,59 @@ class HaierAC(HaierDevice):
             self._command(power, {"status"}, then={"commands": follow, "names": names})
         else:
             # Always send status=on (do not skip on a cached self.status): the cached value can
-            # be stale after an optimistic update or a lost command.
-            self._command(power + follow, {"status"} | names)
+            # be stale after an optimistic update or a lost command. Believed on: should the cloud
+            # refuse "power on" for the running unit together with the rest (errNo 22), the mode
+            # and setpoint go out once more alone (on_reject).
+            self._command(power + follow, {"status"} | names,
+                          on_reject=follow if self.status == 1 else None)
 
     def switch_off(self) -> None:
         self._command(self._get_status_commands(turn_on=False), {"status"})
+
+    def _rejected_rest(self, entry: dict) -> list[dict]:
+        # The cloud may refuse "power on" for a unit that runs already (errNo 22), and the rest of
+        # the group with it: a mode change of a unit believed on goes out as power + mode
+        # (switch_on always sends the power command). That mode / setpoint — recorded when the
+        # group was sent, not judged by the state now (optimistically "on" after any power-on),
+        # and without the cloud's power-on side commands — is sent once more on its own.
+        return list(entry.get("on_reject") or [])
+
+    def _send_rest(self, commands: list[dict]) -> None:
+        # Runs in its own thread (not the WS thread, which delivers the answers).
+        if self._stopped():
+            return
+        _LOGGER.info(f"{self.device_name}: power on refused for a running unit, sending the rest alone")
+        try:
+            self._command(commands, set())  # checked when they went out first
+        except Exception as e:
+            _LOGGER.warning(f"{self.device_name}: failed to send the rest of a refused command: {e}")
+            self._schedule_refresh_after_failure()
 
     def _send_followup(self, then: dict) -> None:
         if not self._stopped():
             self._command(then["commands"], then["names"])
 
-    def _command(self, commands: list[dict], names: set[str], then: dict | None = None) -> list[dict]:
+    def _command(self, commands: list[dict], names: set[str], then: dict | None = None,
+                 user: bool = False, on_reject: list[dict] | None = None) -> list[dict]:
         # Sends what the device accepts in its current state and shows the result at once —
         # including the side commands the API constraints add (a mode change that also resets
         # the fan, "quiet on" that switches turbo off). Returns the commands sent.
+        # user: a request from HA (a service call) — when nothing of it can go out, it fails with
+        # an error the user sees instead of only a line in the log.
         allowed, refused = self._writable(commands, names)
         if refused:
             _LOGGER.warning(f"{self.device_name}: not sent, the device does not accept it now: {'; '.join(refused)}")
+            requested = {str(self.config[n]) for n in names} - {"None"}
+            if user and not any(str(c.get("commandName")) in requested for c in allowed):
+                self.write_ha_state()  # the entity shows the unchanged state again
+                raise HomeAssistantError(
+                    translation_domain=C.DOMAIN,
+                    translation_key="command_refused",
+                    translation_placeholders={"device": str(self.device_name), "details": "; ".join(refused)},
+                )
         if allowed:
-            self._send_commands(allowed, then=then)
+            on_reject = [c for c in on_reject or [] if c in allowed] or None
+            self._send_commands(allowed, then=then, on_reject=on_reject)
             self._apply_optimistic(allowed + (then["commands"] if then else []))
         self.write_ha_state()
         return allowed
@@ -2565,7 +2925,7 @@ class HaierAC(HaierDevice):
 
     def _set(self, name: str, value) -> None:
         if commands := self.get_commands(name, value):
-            self._command(commands, {name})
+            self._command(commands, {name}, user=True)
 
     def set_fan_mode(self, value: str) -> None:
         self._set("fan_mode", value)
@@ -2579,7 +2939,7 @@ class HaierAC(HaierDevice):
     def set_preset_mode(self, value: str) -> None:
         if commands := self.get_commands("preset_mode", value):
             names = {a.name for a in self.config.attrs if a.name.startswith("preset_mode_")}
-            if self._command(commands, names):
+            if self._command(commands, names, user=True):
                 # none/sleep/boost are then derived from quiet/turbo; a custom preset of the
                 # model YAML is kept as is
                 self.preset_mode = value
@@ -2618,28 +2978,39 @@ class HaierAC(HaierDevice):
     def create_entities_climate(self) -> list:
         from . import climate
         return [climate.HaierACEntity(self)]
-    
-    def create_entities_switch(self) -> list:
-        from . import switch
+
+    def create_entities_sensor(self) -> list:
+        from . import sensor
         entities = []
-        if self.config['light'] is not None:
-            entities.append(switch.HaierACLightSwitch(self))
-        if self.config['sound'] is not None:
-            entities.append(switch.HaierACSoundSwitch(self))
-        if self.config['quiet'] is not None:
-            entities.append(switch.HaierACQuietSwitch(self))
-        if self.config['turbo'] is not None:
-            entities.append(switch.HaierACTurboSwitch(self))
-        if self.config['health'] is not None:
-            entities.append(switch.HaierACHealthSwitch(self))
-        if self.config['comfort'] is not None:
-            entities.append(switch.HaierACComfortSwitch(self))
-        if self.config['cleaning'] is not None:
-            entities.append(switch.HaierACCleaningSwitch(self))
-        if self.config['antifreeze'] is not None:
-            entities.append(switch.HaierACAntiFreezeSwitch(self))
-        if self.config['autohumidity'] is not None:
-            entities.append(switch.HaierACAutoHumiditySwitch(self))
+        if self.config['current_temperature'] is not None:
+            # The room temperature as a sensor of its own: history and long-term statistics.
+            entities.append(sensor.HaierACTemperatureSensor(self))
+        return entities
+
+    def create_entities_binary_sensor(self) -> list:
+        from . import binary_sensor
+        return [
+            binary_sensor.HaierProblemSensor(self),
+            binary_sensor.HaierFilterSensor(self),
+            binary_sensor.HaierConnectivitySensor(self),
+            binary_sensor.HaierFirmwareUpdateSensor(self),
+        ]
+
+    def create_entities_switch(self) -> list:
+        # Switches for what the Evo app offers: the rest (e.g. "Звуковой сигнал", which
+        # AS25S2SF2FA refuses with errNo -1) is not created, and the switches earlier versions
+        # created leave the registry. Without screens in the description everything is offered.
+        from . import switch
+        entities, hidden = [], []
+        for feature, cls in switch.AC_SWITCHES:
+            code = self.config[feature]
+            if code is None:
+                continue
+            if self.offered_by_app(code):
+                entities.append(cls(self))
+            else:
+                hidden.append(("switch", f"{self.device_id}_{self.device_model}_{feature}"))
+        self.hidden_entities = [h for h in self.hidden_entities if h[0] != "switch"] + hidden
         return entities
 
     def create_entities_select(self) -> list:
@@ -2844,7 +3215,15 @@ class HaierWM(HaierDevice):
         self.remaining_hours = None
         self.remaining_minutes = None
         self.remote_control = None
+        self.child_lock = None
         self.phase = None
+        # The state of the program as the cloud names it (IN_PROGRESS, PAUSED, FINISHED...), from
+        # control.currentProgram over REST and from the program events; see state.
+        self.program_status = None
+        # {meaning: code} from the app's screens (laundry_codes) and, for the attributes the model's
+        # YAML does not name, {code: attribute name} (see _set_attribute_value).
+        self._meaning_codes: dict[str, str] = {}
+        self._meaning_names: dict[str, str] = {}
         # Remaining time of models that report it as one attribute (minutes) instead of h + min.
         self._remaining_total = None
         self.programs: list[dict] = []
@@ -2900,6 +3279,25 @@ class HaierWM(HaierDevice):
         return (self.remaining_hours or 0) * 60 + (self.remaining_minutes or 0)
 
     @property
+    def state(self) -> str | None:
+        # off / idle / running / paused / finished / cancelled: an automation on "finished"
+        # tells that the washing is done.
+        if self.status == "off":
+            return "off"
+        state = WM_PROGRAM_STATES.get(self.program_status or "")
+        if state is not None:
+            return state
+        if self.phase is None:
+            return None if self.status is None else "idle"
+        return "idle" if self.phase == 0 else "running"
+
+    def _code_of(self, name: str) -> str | None:
+        # The attribute code of a HaierWM attribute: from the model's YAML, else by its meaning.
+        if self._config is not None and (code := self._config[name]) is not None:
+            return str(code)
+        return next((code for code, n in self._meaning_names.items() if n == name), None)
+
+    @property
     def cycle_active(self) -> bool:
         # The machine is on (models without the on/off attribute: a phase or time is reported).
         if self.status is not None:
@@ -2924,8 +3322,8 @@ class HaierWM(HaierDevice):
         codes = set()
         if config is not None:
             for name in ("status", "remaining_hours", "remaining_minutes", "remaining_time"):
-                if (code := config[name]) is not None:
-                    codes.add(str(code))
+                if (code := self._code_of(name)) is not None:
+                    codes.add(code)
         if self._phase_attr is not None:
             codes.add(self._phase_attr)
         return codes
@@ -2946,11 +3344,28 @@ class HaierWM(HaierDevice):
         # may have reached the machine, and the user can repeat it after seeing the real state.
         return not any(str(c.get("commandName")) in C.WM_PROGRAM_ID_ATTRS for c in commands)
 
+    @staticmethod
+    def _program_state(status) -> str | None:
+        # "PROGRAM_STARTED" / "IN_PROGRESS" / "paused" -> "STARTED" / "IN_PROGRESS" / "PAUSED".
+        return str(status).strip().upper().removeprefix("PROGRAM_") or None if isinstance(status, str) else None
+
     def _handle_program_event(self, received_message: dict) -> None:
-        # The program started, paused, finished or was cancelled: the event itself says little
-        # (and its shape is not documented), so the state is re-read over REST right away.
+        # The program started, paused, finished or was cancelled. The event carries
+        # {"data": {"program": {"title", "status"}}} or {"data": {"status": "PROGRAM_STARTED"}}
+        # (shapes from upstream's tests, no capture seen yet); the state is also re-read over
+        # REST right away.
         super()._handle_program_event(received_message)
+        data = received_message.get("data")
+        data = data if isinstance(data, dict) else {}
+        program = data.get("program") if isinstance(data.get("program"), dict) else data
+        if (state := self._program_state(program.get("status"))) is not None:
+            self.program_status = state
+        title = program.get("title")
+        if isinstance(title, str) and title.strip():
+            self._rest_program = title.strip()
+            self._update_program()
         self._poll_requested = True
+        self.write_ha_state()
 
     def _handle_connection_status(self, received_message: dict) -> None:
         # Back on the network after a loss: what the machine did meanwhile was not pushed.
@@ -2983,6 +3398,10 @@ class HaierWM(HaierDevice):
             "remaining_minutes": self.remaining_minutes,
             "remaining_time": self.remaining_time,
             "remote_control": self.remote_control,
+            "child_lock": self.child_lock,
+            "state": self.state,
+            "program_status": self.program_status,
+            "codes": dict(self._meaning_codes),
             "phase": self.phase,
             "phase_label": self.phase_label,
             "programs": [p["name"] for p in self.programs],
@@ -2994,6 +3413,12 @@ class HaierWM(HaierDevice):
         config = CFG.HaierWMConfig(self.device_model, self.hass.config.path(C.DOMAIN))
         config.attrs.extend(sorted(map(CFG.Attribute, data.get("attributes") or []), key=CFG.Attribute.sort_key))
         config.merge_attributes()
+        # What the app's screens say the attributes mean: read for those the YAML does not name.
+        self._meaning_codes = laundry_codes(self.status_data)
+        self._meaning_names = {
+            code: name for meaning, code in self._meaning_codes.items()
+            if (name := WM_MEANINGS.get(meaning)) and name != "phase" and config[name] is None
+        }
         # Programs and the monitoring screen come from the full backend_data (allProgram /
         # monitoringScreen sit next to smartDeviceControl). They are parsed before the values
         # are applied: they extend the temperature/spin options and name the phase attribute.
@@ -3015,28 +3440,46 @@ class HaierWM(HaierDevice):
         if not (attr and value is not None):
             return
         code = str(code)
+        # The YAML's name; for an attribute it does not name, the meaning the app's screens give.
+        # The cloud labels the values of such attributes "not found": they are read raw.
+        by_meaning = attr.name in (None, "", "unknown")
+        name = self._meaning_names.get(code) if by_meaning else attr.name
+
+        def flag() -> bool:
+            if not by_meaning:
+                label = attr.get_item_name(value, value)
+                if label not in (None, "unknown"):
+                    return parsebool(label)
+            return parsebool(self._norm_value(value))
+
         if code in C.WM_PROGRAM_ID_ATTRS:
             self._program_codes[code] = self._code(value)
             self._update_program()
         elif code == self._phase_attr:
             self.phase = parseint(value)
-        elif attr.name == "status":
-            self.status = attr.get_item_name(value)
+        elif name == "status":
+            # Mapped by the YAML ("true" -> "on"); read as a flag where nothing maps it.
+            previous = self.status
+            self.status = "on" if flag() else "off"
+            if previous == "off" and self.status == "on" and self.program_status in ("FINISHED", "CANCELED", "CANCELLED"):
+                self.program_status = None  # switched on again: the last program's end is history
             self._update_program()
-        elif attr.name == "program":
+        elif name == "program":
             self.program = attr.get_item_name(value)
-        elif attr.name == "temperature":
+        elif name == "temperature":
             self.temperature = attr.get_item_name(value)
-        elif attr.name == "spin_speed":
+        elif name == "spin_speed":
             self.spin_speed = attr.get_item_name(value)
-        elif attr.name == "remaining_hours":
+        elif name == "remaining_hours":
             self.remaining_hours = parseint(value)
-        elif attr.name == "remaining_minutes":
+        elif name == "remaining_minutes":
             self.remaining_minutes = parseint(value)
-        elif attr.name == "remaining_time":
+        elif name == "remaining_time":
             self._remaining_total = parsefloat(value)
-        elif attr.name == "remote_control":
-            self.remote_control = parsebool(attr.get_item_name(value, value))
+        elif name == "remote_control":
+            self.remote_control = flag()
+        elif name == "child_lock":
+            self.child_lock = flag()
 
     def _parse_programs(self, data: dict) -> None:
         data = data or {}
@@ -3088,8 +3531,18 @@ class HaierWM(HaierDevice):
                     "ids": ids,
                 })
         self.programs = programs
-        # Program title from REST, if the device reports one (used when the codes do not match)
-        self._rest_program = (control.get("currentProgram") or {}).get("title") or None
+        # Program title from REST, if the device reports one (used when the codes do not match),
+        # and the state of the program (IN_PROGRESS, PAUSED, FINISHED, CANCELLED...).
+        current = control.get("currentProgram") if isinstance(control, dict) else None
+        current = current if isinstance(current, dict) else {}
+        title = current.get("title")
+        self._rest_program = title.strip() if isinstance(title, str) and title.strip() else None
+        state = self._program_state(current.get("status"))
+        if state is not None or self.program_status not in ("FINISHED", "CANCELED", "CANCELLED"):
+            # A REST read without a current program does not wipe the end of the last one (from
+            # the program event): "finished" stays until the machine is switched on again or a
+            # new program runs.
+            self.program_status = state
 
     def _parse_monitoring(self, data: dict) -> None:
         # monitoringScreen names the cycle-phase attribute and titles its values. It sits at the
@@ -3105,6 +3558,8 @@ class HaierWM(HaierDevice):
                 break
         phase = screen.get("phase") if isinstance(screen.get("phase"), dict) else {}
         name = phase.get("name")
+        if name in (None, ""):
+            name = self._meaning_codes.get("cyclePhase")  # the screens' link, when the block lacks it
         self._phase_attr = str(name) if name not in (None, "") else None
         labels = {}
         titles = phase.get("cyclePhaseValueToTitle")
@@ -3244,10 +3699,10 @@ class HaierWM(HaierDevice):
 
     def create_entities_sensor(self) -> list:
         from . import sensor
-        entities = []
-        if any(self.config[n] is not None for n in ("remaining_minutes", "remaining_hours", "remaining_time")):
+        entities = [sensor.HaierWMStateSensor(self)]
+        if any(self._code_of(n) is not None for n in ("remaining_minutes", "remaining_hours", "remaining_time")):
             entities.append(sensor.HaierWMRemainingTimeSensor(self))
-        if self.config['status'] is not None:
+        if self._code_of('status') is not None:
             entities.append(sensor.HaierWMStatusSensor(self))
         if self._phase_attr is not None:
             entities.append(sensor.HaierWMPhaseSensor(self))
@@ -3255,9 +3710,11 @@ class HaierWM(HaierDevice):
 
     def create_entities_binary_sensor(self) -> list:
         from . import binary_sensor
-        entities = []
-        if self.config['remote_control'] is not None:
+        entities = [binary_sensor.HaierProblemSensor(self), binary_sensor.HaierConnectivitySensor(self)]
+        if self._code_of('remote_control') is not None:
             entities.append(binary_sensor.HaierWMRemoteControlSensor(self))
+        if self._code_of('child_lock') is not None:
+            entities.append(binary_sensor.HaierWMChildLockSensor(self))
         return entities
 
 

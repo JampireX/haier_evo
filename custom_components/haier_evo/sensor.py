@@ -1,5 +1,5 @@
 import weakref
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.core import HomeAssistant
 from homeassistant.const import UnitOfTemperature
 from . import api
@@ -97,6 +97,34 @@ class HaierREFFreezerModeSensor(HaierREFFridgeModeSensor):
         self._device_attr_name = "freezer_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_mode"
         self._attr_translation_key = "ref_freezer_mode"
+
+
+class HaierACTemperatureSensor(HaierSensor):
+    # The room temperature as a sensor of its own (the climate entity has it as an attribute only):
+    # history and long-term statistics.
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+
+    def __init__(self, device: api.HaierAC):
+        super().__init__(device)
+        self._device_attr_name = "current_temperature"
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_temperature"
+        self._attr_translation_key = "ac_room_temperature"
+
+
+class HaierWMStateSensor(HaierSensor):
+    # off / idle / running / paused / finished / cancelled: an automation on "finished" tells
+    # that the washing is done.
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(api.WM_STATES)
+    _attr_icon = "mdi:washing-machine"
+
+    def __init__(self, device: api.HaierWM):
+        super().__init__(device)
+        self._device_attr_name = "state"
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_state"
+        self._attr_translation_key = "wm_state"
 
 
 class HaierWMRemainingTimeSensor(HaierSensor):
